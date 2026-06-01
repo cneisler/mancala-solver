@@ -157,31 +157,58 @@ impl Searcher {
         }
     }
 
-    /// Transposition-table key: cells + side to move + a depth marker (255 for
-    /// exact searches so they never collide with depth-limited entries).
+    /// Transposition-table key: side to move + a depth marker (255 for exact
+    /// searches so they never collide with depth-limited entries) + the seed
+    /// counts.
     ///
-    /// Returns `Some` packed `u128` when every cell fits in [`CELL_BITS`] and the
-    /// total bit-width fits; otherwise `None` (such positions skip the TT — they
-    /// only occur on very large boards or with very full pits).
+    /// In exact mode the key packs **only the pits**, not the stores: the stored
+    /// value is the store-independent future differential `g`, so all positions
+    /// sharing a pit layout and side to move collapse to one entry (see the
+    /// `±store_diff` transform in [`Self::search`]). In depth-limited mode the
+    /// heuristic depends on the stores, so the full cell layout is keyed.
+    ///
+    /// Returns `None` when the packed key would not fit in a `u128` (only very
+    /// large boards or extremely full pits).
     fn key(b: &Board, depth: Option<u32>) -> Option<u128> {
+        let n = b.pits_per_side();
         let cells = b.cells();
+        let store_independent = depth.is_none();
+        let included = if store_independent { 2 * n } else { 2 * n + 2 };
         // Bits: cells (CELL_BITS each) + 1 turn bit + 8 depth-marker bits.
-        let needed = cells.len() as u32 * CELL_BITS + 1 + 8;
-        if needed > 128 || cells.iter().any(|&c| (c as u32) >= (1 << CELL_BITS)) {
+        if included as u32 * CELL_BITS + 1 + 8 > 128 {
             return None;
         }
-        let turn_bit: u128 = match b.turn() {
-            Player::P0 => 0,
-            Player::P1 => 1,
+        let mut packed: u128 = 0;
+        let mut push = |c: u8| -> bool {
+            if (c as u32) >= (1 << CELL_BITS) {
+                return false;
+            }
+            packed = (packed << CELL_BITS) | c as u128;
+            true
         };
+        if store_independent {
+            for i in 0..n {
+                if !push(cells[b.pit_global(Player::P0, i)]) {
+                    return None;
+                }
+            }
+            for i in 0..n {
+                if !push(cells[b.pit_global(Player::P1, i)]) {
+                    return None;
+                }
+            }
+        } else {
+            for &c in cells {
+                if !push(c) {
+                    return None;
+                }
+            }
+        }
+        let turn_bit: u128 = if b.turn() == Player::P1 { 1 } else { 0 };
         let depth_marker: u128 = match depth {
             None => 255,
             Some(d) => d.min(254) as u128,
         };
-        let mut packed: u128 = 0;
-        for &c in cells {
-            packed = (packed << CELL_BITS) | c as u128;
-        }
         packed = (packed << 1) | turn_bit;
         packed = (packed << 8) | depth_marker;
         Some(packed)
@@ -278,18 +305,29 @@ impl Searcher {
             return self.heuristic(b);
         }
 
+        // In exact mode the TT stores the store-independent value `g = M - sd`
+        // (`sd` = banked store difference). Adding `sd` back reconstructs this
+        // position's true margin; in depth-limited mode `sd` is 0 (no transform).
+        let sd = if depth.is_none() {
+            let p = b.turn();
+            b.store(p) as i32 - b.store(p.other()) as i32
+        } else {
+            0
+        };
+
         let key = Self::key(b, depth);
         let alpha_orig = alpha;
         let mut tt_move = None;
         if let Some(k) = key {
             if let Some(e) = self.tt.get(&k) {
+                let val = e.value + sd;
                 match e.flag {
-                    Flag::Exact => return e.value,
-                    Flag::Lower => alpha = alpha.max(e.value),
-                    Flag::Upper => beta = beta.min(e.value),
+                    Flag::Exact => return val,
+                    Flag::Lower => alpha = alpha.max(val),
+                    Flag::Upper => beta = beta.min(val),
                 }
                 if alpha >= beta {
-                    return e.value;
+                    return val;
                 }
                 tt_move = if e.best == 255 { None } else { Some(e.best as usize) };
             }
@@ -362,7 +400,8 @@ impl Searcher {
                 self.tt.insert(
                     k,
                     TtEntry {
-                        value: best,
+                        // Store the store-independent value (subtract `sd`).
+                        value: best - sd,
                         flag,
                         best: best_move.map_or(255, |m| m as u8),
                     },
