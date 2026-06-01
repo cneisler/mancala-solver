@@ -150,6 +150,9 @@ struct Searcher {
     rules: Rules,
     tt: TtMap,
     tt_cap: usize,
+    /// History heuristic: cumulative beta-cutoff weight per `[side][pit]`, used
+    /// to order quiet moves. Coarse (only 2 × MAX_PITS buckets) but cheap.
+    history: [[u32; MAX_PITS]; 2],
     nodes: u64,
     budget: u64,
     aborted: bool,
@@ -161,6 +164,7 @@ impl Searcher {
             rules,
             tt: TtMap::default(),
             tt_cap: TT_MAX_ENTRIES,
+            history: [[0; MAX_PITS]; 2],
             nodes: 0,
             budget,
             aborted: false,
@@ -218,23 +222,34 @@ impl Searcher {
                 count += 1;
             }
         }
+        let hist = &self.history[Self::pidx(p)];
         let moves = &mut buf[..count];
         moves.sort_by_key(|&mv| {
             let i = mv as usize;
             let seeds = cells[b.pit_global(p, i)] as usize;
             let mut rank = 0i32;
             if Some(i) == tt_move {
-                rank -= 1000;
+                rank -= 1_000_000;
             }
             // Distance from this pit to the player's own store is `n - i` for
             // both players; a single-lap sow lands in the store when equal.
             if seeds == n - i {
-                rank -= 100;
+                rank -= 10_000;
             }
-            rank -= i as i32; // prefer pits nearer the store
+            // History: quiet moves that have caused cutoffs sort earlier. Capped
+            // so it never outranks the TT or extra-turn moves.
+            rank -= hist[i].min(8_000) as i32;
+            rank -= i as i32; // tie-break: prefer pits nearer the store
             rank
         });
         count
+    }
+
+    fn pidx(p: Player) -> usize {
+        match p {
+            Player::P0 => 0,
+            Player::P1 => 1,
+        }
     }
 
     fn heuristic(&self, b: &Board) -> i32 {
@@ -291,18 +306,40 @@ impl Searcher {
         let mut buf = [0u8; MAX_PITS];
         let count = self.ordered_moves(b, tt_move, &mut buf);
         let child_depth = depth.map(|d| d - 1);
+        let p = b.turn();
 
         let mut best = i32::MIN;
         let mut best_move = None;
-        for &mv in &buf[..count] {
+        for (idx, &mv) in buf[..count].iter().enumerate() {
             let mv = mv as usize;
             let r = b.apply(&self.rules, mv);
+
+            // Principal Variation Search: search the first move with the full
+            // window; probe the rest with a null window and only re-search the
+            // few that beat alpha. For extra-turn moves the same player
+            // continues, so the perspective and window are not negated.
             let v = if r.extra_turn {
-                // Same player continues: keep perspective and window.
-                self.search(&r.board, alpha, beta, child_depth)
-            } else {
+                if idx == 0 {
+                    self.search(&r.board, alpha, beta, child_depth)
+                } else {
+                    let probe = self.search(&r.board, alpha, alpha + 1, child_depth);
+                    if probe > alpha && probe < beta {
+                        self.search(&r.board, alpha, beta, child_depth)
+                    } else {
+                        probe
+                    }
+                }
+            } else if idx == 0 {
                 -self.search(&r.board, -beta, -alpha, child_depth)
+            } else {
+                let probe = -self.search(&r.board, -alpha - 1, -alpha, child_depth);
+                if probe > alpha && probe < beta {
+                    -self.search(&r.board, -beta, -alpha, child_depth)
+                } else {
+                    probe
+                }
             };
+
             if self.aborted {
                 return 0;
             }
@@ -312,6 +349,8 @@ impl Searcher {
             }
             alpha = alpha.max(v);
             if alpha >= beta {
+                // Beta cutoff: reward this move in the history table.
+                self.history[Self::pidx(p)][mv] += 1;
                 break;
             }
         }
