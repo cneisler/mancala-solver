@@ -248,15 +248,21 @@ fn render_analysis(board: &Board, a: &Analysis) -> String {
     out.push_str("Move evaluations (best first):\n");
     let unit = if a.exact { "seeds" } else { "score" };
     for (rank, m) in a.move_evals.iter().enumerate() {
+        // Inferior moves carry only an upper bound (`≤`); see `MoveEval::bound`.
+        let approx = if m.bound { "≤ " } else { "" };
         out.push_str(&format!(
-            "  {marker} pit {pit}: {sign}{val} {unit}{tags}\n",
+            "  {marker} pit {pit}: {approx}{sign}{val} {unit}{tags}\n",
             marker = if rank == 0 { "*" } else { " " },
             pit = m.pit,
+            approx = approx,
             sign = if m.value >= 0 { "+" } else { "-" },
             val = m.value.abs(),
             unit = unit,
             tags = move_tags(m),
         ));
+    }
+    if a.move_evals.iter().any(|m| m.bound) {
+        out.push_str("  (≤ marks moves proven no better than the best; exact value not computed)\n");
     }
 
     // Principal variation.
@@ -289,7 +295,7 @@ fn move_tags(m: &MoveEval) -> String {
 /// any extra-turn / capture flags.
 fn render_pv(board: &Board, pv: &[usize]) -> String {
     let rules = Rules::default();
-    let mut cur = board.clone();
+    let mut cur = *board;
     let mut parts = Vec::new();
     for &mv in pv {
         if cur.is_terminal() || mv >= cur.pits_per_side() {

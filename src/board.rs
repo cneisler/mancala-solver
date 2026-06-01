@@ -16,6 +16,14 @@
 
 use std::fmt;
 
+/// Maximum number of board cells (`2 * pits_per_side + 2`). Boards are stored in
+/// a fixed-size stack array so positions are cheap to copy during search (no
+/// heap allocation per node). This caps the board at [`MAX_PITS`] pits per side.
+pub const MAX_CELLS: usize = 32;
+
+/// Maximum pits per side, derived from [`MAX_CELLS`].
+pub const MAX_PITS: usize = (MAX_CELLS - 2) / 2;
+
 /// The two players. `P0` is conventionally rendered as the South (bottom) side,
 /// `P1` as the North (top) side.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -74,21 +82,31 @@ pub struct MoveResult {
 }
 
 /// A Mancala position: the seed counts, the board size, and the side to move.
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+///
+/// `cells` is a fixed-size array; only the first `2 * pits_per_side + 2` entries
+/// are meaningful and the remainder are kept zero, so the type is `Copy` and
+/// can be cloned during search without allocating.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct Board {
     pits_per_side: usize,
-    cells: Vec<u8>,
+    cells: [u8; MAX_CELLS],
     turn: Player,
 }
 
 impl Board {
     /// Build a board from explicit cell counts.
     ///
-    /// `cells` must have length `2 * pits_per_side + 2` and the total number of
-    /// seeds must fit in a `u8` (≤ 255). Returns an error otherwise.
+    /// `cells` must have length `2 * pits_per_side + 2`, `pits_per_side` must be
+    /// in `1..=MAX_PITS`, and the total number of seeds must fit in a `u8`
+    /// (≤ 255). Returns an error otherwise.
     pub fn new(pits_per_side: usize, cells: Vec<u8>, turn: Player) -> Result<Board, String> {
         if pits_per_side == 0 {
             return Err("pits_per_side must be at least 1".to_string());
+        }
+        if pits_per_side > MAX_PITS {
+            return Err(format!(
+                "pits_per_side {pits_per_side} exceeds the supported maximum of {MAX_PITS}"
+            ));
         }
         let expected = 2 * pits_per_side + 2;
         if cells.len() != expected {
@@ -104,9 +122,11 @@ impl Board {
                 u8::MAX
             ));
         }
+        let mut buf = [0u8; MAX_CELLS];
+        buf[..expected].copy_from_slice(&cells);
         Ok(Board {
             pits_per_side,
-            cells,
+            cells: buf,
             turn,
         })
     }
@@ -132,7 +152,7 @@ impl Board {
 
     /// Raw cell counts (see the module docs for the layout).
     pub fn cells(&self) -> &[u8] {
-        &self.cells
+        &self.cells[..self.total_cells()]
     }
 
     /// Total number of cells, `2 * pits_per_side + 2`.
@@ -224,7 +244,7 @@ impl Board {
         let start = self.pit_global(p, mv);
         assert!(self.cells[start] > 0, "cannot play from an empty pit");
 
-        let mut b = self.clone();
+        let mut b = *self;
         let total = b.total_cells();
         let own_store = b.store_index(p);
         let opp_store = b.store_index(p.other());
@@ -279,6 +299,7 @@ impl Board {
     /// pit seeds are swept into its own store. Safe to call on any position
     /// (only the side with seeds contributes), but only meaningful at terminal.
     pub fn final_scores(&self) -> (u32, u32) {
+        // No mutation needed; sum each side's pits plus its store directly.
         let mut score = [0u32; 2];
         for (idx, p) in [Player::P0, Player::P1].into_iter().enumerate() {
             let mut total = self.cells[self.store_index(p)] as u32;

@@ -104,14 +104,29 @@ PV annotations: `↻` marks a move that earns an extra turn, `×` marks a captur
 
 ### A note on exact solving and board size
 
-Exact solving is a full search to the end of the game, so its cost grows
-quickly with board size. On this engine, boards up to roughly Kalah(4,4) /
-Kalah(6,2) solve exactly in well under a minute; larger boards (e.g. the
-classic Kalah(6,4)) exceed the default node budget and automatically fall back
-to the depth-limited **heuristic** search, which is clearly labelled in the
-output. Raise `--budget` to spend more effort on an exact result (memory stays
-bounded — the solver will not exhaust RAM), or lower `--depth` for a faster
-heuristic answer.
+Exact solving is a full search to the end of the game (alpha-beta with a
+transposition table), so its cost grows steeply with board size. Approximate
+exact-solve times on this engine:
+
+| Board | Result (player 1) | Time |
+| --- | --- | --- |
+| Kalah(5,2) | win by 2 | <0.1 s |
+| Kalah(6,2) | win by 6 | <0.5 s |
+| Kalah(4,4) | win by 2 | ~1 s |
+| Kalah(5,3) | win by 6 | ~1 s |
+| Kalah(5,4) | win by 10 | ~45 s |
+| Kalah(6,3) | win by 2 | ~1 min |
+
+Larger boards (e.g. the classic Kalah(6,4)) exceed the default node budget and
+automatically fall back to the depth-limited **heuristic** search, which is
+clearly labelled in the output. Raise `--budget` to spend more effort on an
+exact result (memory stays bounded — the solver caps its transposition table
+and will not exhaust RAM), or lower `--depth` for a faster heuristic answer.
+
+The move-evaluation table reports an **exact** value for the best move; clearly
+inferior moves are shown as a bound (e.g. `≤ +2 seeds`) because the solver
+proves they cannot beat the best move rather than spending time computing their
+exact value.
 
 ## Project layout
 

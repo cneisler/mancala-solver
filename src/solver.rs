@@ -13,8 +13,9 @@
 //! difference and are not directly comparable to exact seed margins.
 
 use std::collections::HashMap;
+use std::hash::{BuildHasherDefault, Hasher};
 
-use crate::board::{Board, Player, Rules};
+use crate::board::{Board, Player, Rules, MAX_PITS};
 
 /// Weight applied to a stored seed in the heuristic evaluation (and to the
 /// terminal margin in depth-limited mode, so terminal results dominate).
@@ -37,7 +38,13 @@ pub struct MoveEval {
     /// 0-based pit index for the side to move.
     pub pit: usize,
     /// Value of the resulting position from the side-to-move's perspective.
+    /// When `bound` is `true` this is only an upper bound (the move is provably
+    /// no better than the best move, so it was not searched to an exact value).
     pub value: i32,
+    /// If `true`, `value` is an upper bound (`≤ value`) rather than exact. This
+    /// happens for inferior moves under the single-pass root search, which
+    /// avoids the cost of proving an exact value for moves that cannot win.
+    pub bound: bool,
     /// Whether this move grants an extra turn.
     pub extra_turn: bool,
     /// Whether this move performs a capture.
@@ -104,28 +111,44 @@ struct TtEntry {
     best: u8,
 }
 
-/// Transposition-table key. Small boards pack the whole position (cells + side +
-/// depth marker) into a single `u128` for fast, allocation-free hashing; larger
-/// boards fall back to a heap-allocated byte key.
-#[derive(Clone, PartialEq, Eq, Hash)]
-enum TtKey {
-    Packed(u128),
-    Wide(Box<[u8]>),
-}
-
 /// Number of bits used to encode a single cell in the packed key. Cells holding
-/// 64 or more seeds force the wide fallback.
+/// 64 or more seeds (or boards too wide to fit) skip the transposition table.
 const CELL_BITS: u32 = 6;
 
-/// Maximum number of transposition-table entries. Caps memory (~40 bytes/entry,
-/// so ≈1 GB here) so an unbounded exact search can never exhaust RAM: once the
-/// table is full we simply stop caching new positions (they are recomputed if
-/// revisited). The search remains correct, only slower.
-const TT_MAX_ENTRIES: usize = 24_000_000;
+/// Maximum number of transposition-table entries. Caps memory so an unbounded
+/// exact search can never exhaust RAM: once the table is full we simply stop
+/// caching new positions (they are recomputed if revisited), keeping the search
+/// correct, only slower. At ~48 bytes per stored entry this is ≈8.5 GB, sized
+/// to let a full Kalah(6,4) solve fit in memory on a 16 GB host.
+const TT_MAX_ENTRIES: usize = 180_000_000;
+
+/// A fast hasher for the already-well-distributed packed `u128` TT keys. The
+/// `HashMap` still stores the full key, so a hash collision only costs a probe,
+/// never correctness.
+#[derive(Default)]
+struct U128Hasher(u64);
+
+impl Hasher for U128Hasher {
+    fn finish(&self) -> u64 {
+        self.0
+    }
+    fn write(&mut self, _bytes: &[u8]) {
+        // Keys are fed via `write_u128`; this path is unused.
+    }
+    fn write_u128(&mut self, i: u128) {
+        let mut h = (i as u64) ^ ((i >> 64) as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+        h ^= h >> 32;
+        h = h.wrapping_mul(0xFF51_AFD7_ED55_8CCD);
+        h ^= h >> 29;
+        self.0 = h;
+    }
+}
+
+type TtMap = HashMap<u128, TtEntry, BuildHasherDefault<U128Hasher>>;
 
 struct Searcher {
     rules: Rules,
-    tt: HashMap<TtKey, TtEntry>,
+    tt: TtMap,
     tt_cap: usize,
     nodes: u64,
     budget: u64,
@@ -136,7 +159,7 @@ impl Searcher {
     fn new(rules: Rules, budget: u64) -> Searcher {
         Searcher {
             rules,
-            tt: HashMap::new(),
+            tt: TtMap::default(),
             tt_cap: TT_MAX_ENTRIES,
             nodes: 0,
             budget,
@@ -144,13 +167,19 @@ impl Searcher {
         }
     }
 
-    /// Transposition-table key: cells + side to move + a depth marker
-    /// (255 for exact searches so they never collide with depth-limited entries).
+    /// Transposition-table key: cells + side to move + a depth marker (255 for
+    /// exact searches so they never collide with depth-limited entries).
     ///
-    /// Packs into a `u128` when every cell fits in [`CELL_BITS`] and the total
-    /// bit-width fits; otherwise falls back to a byte key.
-    fn key(b: &Board, depth: Option<u32>) -> TtKey {
+    /// Returns `Some` packed `u128` when every cell fits in [`CELL_BITS`] and the
+    /// total bit-width fits; otherwise `None` (such positions skip the TT — they
+    /// only occur on very large boards or with very full pits).
+    fn key(b: &Board, depth: Option<u32>) -> Option<u128> {
         let cells = b.cells();
+        // Bits: cells (CELL_BITS each) + 1 turn bit + 8 depth-marker bits.
+        let needed = cells.len() as u32 * CELL_BITS + 1 + 8;
+        if needed > 128 || cells.iter().any(|&c| (c as u32) >= (1 << CELL_BITS)) {
+            return None;
+        }
         let turn_bit: u128 = match b.turn() {
             Player::P0 => 0,
             Player::P1 => 1,
@@ -159,39 +188,53 @@ impl Searcher {
             None => 255,
             Some(d) => d.min(254) as u128,
         };
-        // Bits: cells (CELL_BITS each) + 1 turn bit + 8 depth-marker bits.
-        let needed = cells.len() as u32 * CELL_BITS + 1 + 8;
-        let packable = needed <= 128 && cells.iter().all(|&c| (c as u32) < (1 << CELL_BITS));
-        if packable {
-            let mut packed: u128 = 0;
-            for &c in cells {
-                packed = (packed << CELL_BITS) | c as u128;
-            }
-            packed = (packed << 1) | turn_bit;
-            packed = (packed << 8) | depth_marker;
-            TtKey::Packed(packed)
-        } else {
-            let mut k = Vec::with_capacity(cells.len() + 2);
-            k.extend_from_slice(cells);
-            k.push(turn_bit as u8);
-            k.push(depth_marker as u8);
-            TtKey::Wide(k.into_boxed_slice())
+        let mut packed: u128 = 0;
+        for &c in cells {
+            packed = (packed << CELL_BITS) | c as u128;
         }
+        packed = (packed << 1) | turn_bit;
+        packed = (packed << 8) | depth_marker;
+        Some(packed)
     }
 
-    /// Order moves to improve alpha-beta pruning: a transposition-table move
-    /// first, then extra-turn moves (computed without cloning the board).
-    fn order_moves(&self, b: &Board, moves: &mut [usize], tt_move: Option<usize>) {
+    /// Generate legal moves for the side to move into `buf`, ordered to improve
+    /// alpha-beta pruning, and return the count. Ordering (all O(1) per move, no
+    /// board cloning or sow simulation):
+    ///   1. the transposition-table move,
+    ///   2. moves that land their last seed in the store on the first lap
+    ///      (an extra turn): `seeds == distance_to_store`,
+    ///   3. remaining pits, those nearer the store first.
+    ///
+    /// The single-lap extra-turn test is exact for the common case and only ever
+    /// affects ordering (never correctness), so multi-lap cases are ignored.
+    fn ordered_moves(&self, b: &Board, tt_move: Option<usize>, buf: &mut [u8; MAX_PITS]) -> usize {
+        let p = b.turn();
+        let n = b.pits_per_side();
+        let cells = b.cells();
+        let mut count = 0;
+        for i in 0..n {
+            if cells[b.pit_global(p, i)] > 0 {
+                buf[count] = i as u8;
+                count += 1;
+            }
+        }
+        let moves = &mut buf[..count];
         moves.sort_by_key(|&mv| {
+            let i = mv as usize;
+            let seeds = cells[b.pit_global(p, i)] as usize;
             let mut rank = 0i32;
-            if Some(mv) == tt_move {
+            if Some(i) == tt_move {
                 rank -= 1000;
             }
-            if b.grants_extra_turn(mv) {
+            // Distance from this pit to the player's own store is `n - i` for
+            // both players; a single-lap sow lands in the store when equal.
+            if seeds == n - i {
                 rank -= 100;
             }
+            rank -= i as i32; // prefer pits nearer the store
             rank
         });
+        count
     }
 
     fn heuristic(&self, b: &Board) -> i32 {
@@ -230,25 +273,29 @@ impl Searcher {
         let key = Self::key(b, depth);
         let alpha_orig = alpha;
         let mut tt_move = None;
-        if let Some(e) = self.tt.get(&key) {
-            match e.flag {
-                Flag::Exact => return e.value,
-                Flag::Lower => alpha = alpha.max(e.value),
-                Flag::Upper => beta = beta.min(e.value),
+        if let Some(k) = key {
+            if let Some(e) = self.tt.get(&k) {
+                match e.flag {
+                    Flag::Exact => return e.value,
+                    Flag::Lower => alpha = alpha.max(e.value),
+                    Flag::Upper => beta = beta.min(e.value),
+                }
+                if alpha >= beta {
+                    return e.value;
+                }
+                tt_move = if e.best == 255 { None } else { Some(e.best as usize) };
             }
-            if alpha >= beta {
-                return e.value;
-            }
-            tt_move = if e.best == 255 { None } else { Some(e.best as usize) };
         }
 
-        let mut moves = b.legal_moves(b.turn());
-        self.order_moves(b, &mut moves, tt_move);
+        // Generate and order moves on the stack (no per-node allocation).
+        let mut buf = [0u8; MAX_PITS];
+        let count = self.ordered_moves(b, tt_move, &mut buf);
         let child_depth = depth.map(|d| d - 1);
 
         let mut best = i32::MIN;
         let mut best_move = None;
-        for mv in moves {
+        for &mv in &buf[..count] {
+            let mv = mv as usize;
             let r = b.apply(&self.rules, mv);
             let v = if r.extra_turn {
                 // Same player continues: keep perspective and window.
@@ -277,16 +324,18 @@ impl Searcher {
             Flag::Exact
         };
         // Stop caching once the table is full to keep memory bounded; existing
-        // entries are retained so most of the cache stays useful.
-        if self.tt.len() < self.tt_cap || self.tt.contains_key(&key) {
-            self.tt.insert(
-                key,
-                TtEntry {
-                    value: best,
-                    flag,
-                    best: best_move.map_or(255, |m| m as u8),
-                },
-            );
+        // entries are retained (and overwritten) so most of the cache stays useful.
+        if let Some(k) = key {
+            if self.tt.len() < self.tt_cap || self.tt.contains_key(&k) {
+                self.tt.insert(
+                    k,
+                    TtEntry {
+                        value: best,
+                        flag,
+                        best: best_move.map_or(255, |m| m as u8),
+                    },
+                );
+            }
         }
         best
     }
@@ -295,14 +344,14 @@ impl Searcher {
     /// *from* `start`. Capped to avoid pathological loops.
     fn follow_pv(&self, start: &Board, depth: Option<u32>, cap: usize) -> Vec<usize> {
         let mut pv = Vec::new();
-        let mut cur = start.clone();
+        let mut cur = *start;
         let mut d = depth;
         while !cur.is_terminal() && pv.len() < cap {
             if d == Some(0) {
                 break;
             }
-            let key = Self::key(&cur, d);
-            let Some(entry) = self.tt.get(&key) else { break };
+            let Some(k) = Self::key(&cur, d) else { break };
+            let Some(entry) = self.tt.get(&k) else { break };
             if entry.best == 255 {
                 break;
             }
@@ -315,8 +364,14 @@ impl Searcher {
         pv
     }
 
-    /// Evaluate every legal move from the root with a full window so the
-    /// per-move values are exact (no root pruning), and assemble the analysis.
+    /// Solve the position with a single alpha-beta pass over the root moves.
+    ///
+    /// Moves are tried best-ordered first; `alpha` rises as better moves are
+    /// found. Once a move establishes the best value, inferior moves fail low
+    /// against the raised window and yield an *upper bound* rather than an exact
+    /// value — they are flagged `bound` in the table. This avoids the ~N× cost
+    /// of proving an exact value for every move while keeping the game value,
+    /// best move, and principal variation exact.
     fn analyze_root(&mut self, b: &Board, depth: Option<u32>) -> Analysis {
         if b.is_terminal() {
             let value = b.terminal_margin(b.turn());
@@ -332,28 +387,36 @@ impl Searcher {
             };
         }
 
-        let mut moves = b.legal_moves(b.turn());
-        self.order_moves(b, &mut moves, None);
+        // Search the likely-best move first so its subtree warms the TT and the
+        // raised alpha lets the siblings fail low quickly.
+        let mut buf = [0u8; MAX_PITS];
+        let count = self.ordered_moves(b, None, &mut buf);
 
-        let mut evals = Vec::with_capacity(moves.len());
+        let mut evals = Vec::with_capacity(count);
+        let mut alpha = -INF;
         let mut best = i32::MIN;
         let mut best_move = None;
         let child_depth = depth.map(|d| d - 1);
 
-        for mv in moves {
+        for &mv in &buf[..count] {
+            let mv = mv as usize;
             let r = b.apply(&self.rules, mv);
+            // beta stays at +INF (no cutoff at the root), so a child only ever
+            // fails low; a returned value `<= alpha` is an upper bound.
             let v = if r.extra_turn {
-                self.search(&r.board, -INF, INF, child_depth)
+                self.search(&r.board, alpha, INF, child_depth)
             } else {
-                -self.search(&r.board, -INF, INF, child_depth)
+                -self.search(&r.board, -INF, -alpha, child_depth)
             };
             if self.aborted {
                 // Caller will discard this partial result.
                 break;
             }
+            let is_bound = v <= alpha && best_move.is_some();
             evals.push(MoveEval {
                 pit: mv,
                 value: v,
+                bound: is_bound,
                 extra_turn: r.extra_turn,
                 captured: r.captured,
             });
@@ -361,9 +424,11 @@ impl Searcher {
                 best = v;
                 best_move = Some(mv);
             }
+            alpha = alpha.max(v);
         }
 
-        evals.sort_by(|a, c| c.value.cmp(&a.value));
+        // Exact values first, then by value; the best move sorts to the top.
+        evals.sort_by(|a, c| a.bound.cmp(&c.bound).then(c.value.cmp(&a.value)));
 
         let pv = match best_move {
             Some(mv) => {
@@ -458,16 +523,36 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "exact solve of Kalah(6,2) takes tens of seconds; run with --ignored"]
     fn kalah_6_2_exact_value_regression() {
-        // A larger board that still solves exactly in a reasonable time (~70M
-        // nodes). Pins the engine's exact result as a regression check.
+        // Solves exactly in well under a second with the optimized search.
         let b = Board::start(6, 2, Player::P0).unwrap();
         let a = analyze(&b, Rules::default(), u64::MAX, 12);
         assert!(a.exact, "Kalah(6,2) should solve exactly");
         assert_eq!(a.value, 6, "Kalah(6,2) is a first-player win by 6 seeds");
         assert_eq!(a.outcome(), Outcome::Win);
         assert_eq!(a.best_move, Some(4));
+        assert!(!a.pv.is_empty());
+    }
+
+    #[test]
+    fn kalah_5_3_exact_value_regression() {
+        // Previously timed out (>60s); now ~2M nodes / ~1s.
+        let b = Board::start(5, 3, Player::P0).unwrap();
+        let a = analyze(&b, Rules::default(), u64::MAX, 12);
+        assert!(a.exact);
+        assert_eq!(a.value, 6, "Kalah(5,3) is a first-player win by 6 seeds");
+        assert_eq!(a.best_move, Some(2));
+    }
+
+    #[test]
+    #[ignore = "exact solve of Kalah(6,3) takes ~1 minute; run with --ignored"]
+    fn kalah_6_3_exact_value_regression() {
+        // A heavier board (~133M nodes). Pins the exact result as a regression.
+        let b = Board::start(6, 3, Player::P0).unwrap();
+        let a = analyze(&b, Rules::default(), u64::MAX, 12);
+        assert!(a.exact, "Kalah(6,3) should solve exactly");
+        assert_eq!(a.value, 2, "Kalah(6,3) is a first-player win by 2 seeds");
+        assert_eq!(a.outcome(), Outcome::Win);
         assert!(!a.pv.is_empty());
     }
 
@@ -485,9 +570,15 @@ mod tests {
         let b = Board::start(3, 3, Player::P0).unwrap();
         let a = solve_exact(&b);
         assert_eq!(a.move_evals.len(), 3);
-        // Sorted best-first.
-        for w in a.move_evals.windows(2) {
-            assert!(w[0].value >= w[1].value);
+        // The best move sorts first and is reported exactly (not a bound).
+        let top = a.move_evals[0];
+        assert_eq!(Some(top.pit), a.best_move);
+        assert!(!top.bound);
+        assert_eq!(top.value, a.value);
+        // Exact evaluations are listed before bounded ones.
+        let first_bound = a.move_evals.iter().position(|m| m.bound);
+        if let Some(idx) = first_bound {
+            assert!(a.move_evals[idx..].iter().all(|m| m.bound));
         }
     }
 }
