@@ -1,0 +1,293 @@
+//! Offline endgame tablebase.
+//!
+//! Stores the store-independent future differential `g(pits, side)` (see
+//! [`crate::endgame`]) for **every** pit layout with at most `cap` seeds in
+//! play, on a fixed board size. Unlike the in-memory [`crate::endgame::Endgame`]
+//! (built lazily during a single search), a tablebase is built once by a
+//! separate command, written to disk, then memory-loaded and queried in O(1)
+//! during any later search.
+//!
+//! # Indexing
+//!
+//! A pit layout is the `2N` pit counts (player 0's pits then player 1's). Layouts
+//! with total ≤ `cap` are enumerated as integer compositions and mapped to a
+//! dense index via the combinatorial number system, so the on-disk form is just
+//! a flat `[i16]` — no keys stored. `data[side * num_layouts + rank(pits)]` is
+//! `g` for that layout and side to move.
+//!
+//! # File format (little-endian)
+//!
+//! ```text
+//! magic        : 8 bytes  = b"KALATB01"
+//! pits_per_side: u32
+//! seeds_cap    : u32
+//! num_layouts  : u64       (= C(cap + 2N, 2N))
+//! data         : i16 * (2 * num_layouts)
+//! ```
+
+use std::fs::File;
+use std::io::{self, BufReader, BufWriter, Read, Write};
+use std::path::Path;
+
+use crate::board::{Board, Player, Rules};
+use crate::endgame::Endgame;
+
+const MAGIC: &[u8; 8] = b"KALATB01";
+
+/// `C(n, k)` for small `n`, computed with a `u128` accumulator to avoid overflow.
+fn binom(n: u64, k: u64) -> u64 {
+    if k > n {
+        return 0;
+    }
+    let k = k.min(n - k);
+    let mut num: u128 = 1;
+    for i in 0..k {
+        num = num * (n - i) as u128 / (i + 1) as u128;
+    }
+    num as u64
+}
+
+/// Number of compositions of `t` into `parts` non-negative parts.
+fn comps(t: u64, parts: u64) -> u64 {
+    if parts == 0 {
+        return if t == 0 { 1 } else { 0 };
+    }
+    binom(t + parts - 1, parts - 1)
+}
+
+/// Number of layouts (compositions into `m` parts) with total **strictly less
+/// than** `t`.
+fn offset(t: u64, m: u64) -> u64 {
+    if t == 0 {
+        0
+    } else {
+        binom(t - 1 + m, m)
+    }
+}
+
+/// Total number of layouts with total ≤ `cap` over `m` parts: `C(cap + m, m)`.
+fn num_layouts(cap: u64, m: u64) -> u64 {
+    binom(cap + m, m)
+}
+
+/// Dense rank of a pit layout (composition) among all layouts with total ≤ cap.
+fn rank(pits: &[u8]) -> u64 {
+    let m = pits.len() as u64;
+    let total: u64 = pits.iter().map(|&x| x as u64).sum();
+    let mut r = offset(total, m);
+    let mut rem = total;
+    for (j, &c) in pits.iter().enumerate() {
+        let parts_left = m - 1 - j as u64; // parts after position j
+        for v in 0..c as u64 {
+            r += comps(rem - v, parts_left);
+        }
+        rem -= c as u64;
+        if parts_left == 0 {
+            break;
+        }
+    }
+    r
+}
+
+/// An endgame tablebase for one board size.
+pub struct Tablebase {
+    pits_per_side: usize,
+    cap: u32,
+    num_layouts: u64,
+    /// `g` values: `data[side * num_layouts + rank]`.
+    data: Vec<i16>,
+}
+
+impl Tablebase {
+    pub fn pits_per_side(&self) -> usize {
+        self.pits_per_side
+    }
+
+    pub fn cap(&self) -> u32 {
+        self.cap
+    }
+
+    /// Number of `g` entries the table would hold for `(pits_per_side, cap)`,
+    /// useful for sizing checks before building.
+    pub fn entry_count(pits_per_side: usize, cap: u32) -> u64 {
+        2 * num_layouts(cap as u64, 2 * pits_per_side as u64)
+    }
+
+    /// Build the tablebase for every layout with ≤ `cap` seeds in play.
+    pub fn build(rules: Rules, pits_per_side: usize, cap: u32) -> Tablebase {
+        let m = 2 * pits_per_side;
+        let total = num_layouts(cap as u64, m as u64);
+        let mut data = vec![0i16; 2 * total as usize];
+
+        // Reuse the verified lazy `g` (memoised) to fill every layout.
+        let mut eg = Endgame::new(rules, cap);
+        let mut pits = vec![0u8; m];
+        for side in 0..2u8 {
+            Self::for_each_layout(cap, &mut pits, &mut |layout| {
+                let board = layout_board(pits_per_side, layout, side);
+                let r = rank(layout);
+                data[side as usize * total as usize + r as usize] = eg.g(&board);
+            });
+        }
+
+        Tablebase {
+            pits_per_side,
+            cap,
+            num_layouts: total,
+            data,
+        }
+    }
+
+    /// Enumerate every composition of total ≤ `cap` into `m` parts, invoking `f`
+    /// with the filled `pits` buffer each time.
+    fn for_each_layout(cap: u32, pits: &mut [u8], f: &mut impl FnMut(&[u8])) {
+        fn rec(idx: usize, remaining: u32, pits: &mut [u8], f: &mut impl FnMut(&[u8])) {
+            if idx == pits.len() - 1 {
+                // Last pit takes anything from 0..=remaining (≤ cap overall).
+                for v in 0..=remaining {
+                    pits[idx] = v as u8;
+                    f(pits);
+                }
+                return;
+            }
+            for v in 0..=remaining {
+                pits[idx] = v as u8;
+                rec(idx + 1, remaining - v, pits, f);
+            }
+        }
+        // `remaining` is the budget for the whole layout (≤ cap).
+        rec(0, cap, pits, f);
+    }
+
+    /// Look up `g` for a position, if its seed count is within the table and the
+    /// board size matches. Returns `None` otherwise.
+    pub fn lookup(&self, b: &Board) -> Option<i16> {
+        if b.pits_per_side() != self.pits_per_side || b.seeds_in_play() > self.cap {
+            return None;
+        }
+        let n = self.pits_per_side;
+        let mut pits = vec![0u8; 2 * n];
+        for i in 0..n {
+            pits[i] = b.cells()[b.pit_global(Player::P0, i)];
+            pits[n + i] = b.cells()[b.pit_global(Player::P1, i)];
+        }
+        let side = if b.turn() == Player::P1 { 1 } else { 0 };
+        let r = rank(&pits);
+        Some(self.data[side * self.num_layouts as usize + r as usize])
+    }
+
+    /// Serialize to `path`.
+    pub fn save(&self, path: &Path) -> io::Result<()> {
+        let mut w = BufWriter::new(File::create(path)?);
+        w.write_all(MAGIC)?;
+        w.write_all(&(self.pits_per_side as u32).to_le_bytes())?;
+        w.write_all(&self.cap.to_le_bytes())?;
+        w.write_all(&self.num_layouts.to_le_bytes())?;
+        for &v in &self.data {
+            w.write_all(&v.to_le_bytes())?;
+        }
+        w.flush()
+    }
+
+    /// Load a tablebase from `path`.
+    pub fn load(path: &Path) -> io::Result<Tablebase> {
+        let mut r = BufReader::new(File::open(path)?);
+        let mut magic = [0u8; 8];
+        r.read_exact(&mut magic)?;
+        if &magic != MAGIC {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "not a Kalah tablebase file",
+            ));
+        }
+        let pits_per_side = read_u32(&mut r)? as usize;
+        let cap = read_u32(&mut r)?;
+        let num_layouts = read_u64(&mut r)?;
+        let count = 2 * num_layouts as usize;
+        let mut data = vec![0i16; count];
+        let mut buf = [0u8; 2];
+        for slot in data.iter_mut() {
+            r.read_exact(&mut buf)?;
+            *slot = i16::from_le_bytes(buf);
+        }
+        Ok(Tablebase {
+            pits_per_side,
+            cap,
+            num_layouts,
+            data,
+        })
+    }
+}
+
+fn read_u32(r: &mut impl Read) -> io::Result<u32> {
+    let mut b = [0u8; 4];
+    r.read_exact(&mut b)?;
+    Ok(u32::from_le_bytes(b))
+}
+
+fn read_u64(r: &mut impl Read) -> io::Result<u64> {
+    let mut b = [0u8; 8];
+    r.read_exact(&mut b)?;
+    Ok(u64::from_le_bytes(b))
+}
+
+/// Build a zero-store board from a pit layout (`P0` pits then `P1` pits).
+fn layout_board(pits_per_side: usize, layout: &[u8], side: u8) -> Board {
+    let n = pits_per_side;
+    let mut cells = vec![0u8; 2 * n + 2];
+    cells[..n].copy_from_slice(&layout[..n]); // P0 pits
+    cells[n + 1..2 * n + 1].copy_from_slice(&layout[n..2 * n]); // P1 pits
+    let turn = if side == 1 { Player::P1 } else { Player::P0 };
+    Board::new(n, cells, turn).expect("valid layout board")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rank_is_a_bijection() {
+        // For m parts and cap C, ranks of all layouts must be exactly 0..total.
+        for (m, cap) in [(2u64, 4u32), (3, 5), (4, 6)] {
+            let total = num_layouts(cap as u64, m) as usize;
+            let mut seen = vec![false; total];
+            let mut pits = vec![0u8; m as usize];
+            Tablebase::for_each_layout(cap, &mut pits, &mut |layout| {
+                let r = rank(layout) as usize;
+                assert!(r < total, "rank {r} out of range {total}");
+                assert!(!seen[r], "duplicate rank {r}");
+                seen[r] = true;
+            });
+            assert!(seen.into_iter().all(|s| s), "every index covered");
+        }
+    }
+
+    #[test]
+    fn tablebase_matches_lazy_g() {
+        // Built values must equal the lazy endgame `g` for every covered layout.
+        let rules = Rules::default();
+        let tb = Tablebase::build(rules, 2, 6);
+        let mut eg = Endgame::new(rules, 6);
+        let mut pits = vec![0u8; 4];
+        for side in 0..2u8 {
+            Tablebase::for_each_layout(6, &mut pits, &mut |layout| {
+                let board = layout_board(2, layout, side);
+                assert_eq!(tb.lookup(&board), Some(eg.g(&board)));
+            });
+        }
+    }
+
+    #[test]
+    fn save_and_load_round_trips() {
+        let tb = Tablebase::build(Rules::default(), 2, 5);
+        let path = std::env::temp_dir().join("mancala_test_tb.bin");
+        tb.save(&path).unwrap();
+        let loaded = Tablebase::load(&path).unwrap();
+        assert_eq!(loaded.pits_per_side(), 2);
+        assert_eq!(loaded.cap(), 5);
+        // Spot-check a couple of layouts.
+        let b = Board::new(2, vec![1, 2, 0, 1, 1, 0], Player::P0).unwrap();
+        assert_eq!(tb.lookup(&b), loaded.lookup(&b));
+        std::fs::remove_file(&path).ok();
+    }
+}
