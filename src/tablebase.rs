@@ -28,11 +28,70 @@
 use std::fs::File;
 use std::io::{self, BufReader, BufWriter, Read, Write};
 use std::path::Path;
+use std::sync::Mutex;
 
 use crate::board::{Board, Player, Rules};
-use crate::endgame::Endgame;
+use crate::hash::U128Map;
 
 const MAGIC: &[u8; 8] = b"KALATB01";
+
+/// Number of shards in the concurrent build memo (low lock contention).
+const BUILD_SHARDS: usize = 512;
+
+/// Mix a packed key down to a `u64` for shard selection.
+fn mix(key: u128) -> u64 {
+    let mut h = (key as u64) ^ ((key >> 64) as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    h ^= h >> 32;
+    h = h.wrapping_mul(0xFF51_AFD7_ED55_8CCD);
+    h ^= h >> 29;
+    h
+}
+
+/// Store-independent key (pit layout + side to move), 6 bits per pit.
+fn g_key(b: &Board) -> u128 {
+    let n = b.pits_per_side();
+    let cells = b.cells();
+    let mut k = 0u128;
+    for i in 0..n {
+        k = (k << 6) | cells[b.pit_global(Player::P0, i)] as u128;
+    }
+    for i in 0..n {
+        k = (k << 6) | cells[b.pit_global(Player::P1, i)] as u128;
+    }
+    (k << 1) | if b.turn() == Player::P1 { 1 } else { 0 }
+}
+
+/// Compute the store-independent future differential `g` for `b`, memoised into
+/// a sharded concurrent table. Locks are held only for the brief get/insert, not
+/// across recursion; computation is idempotent, so concurrent threads racing on
+/// the same layout simply recompute the (identical) value.
+fn solve_g(b: &Board, rules: &Rules, memo: &[Mutex<U128Map<i16>>]) -> i16 {
+    if b.is_terminal() {
+        let p = b.turn();
+        return b.pit_seeds(p) as i16 - b.pit_seeds(p.other()) as i16;
+    }
+    let key = g_key(b);
+    let shard = &memo[(mix(key) as usize) % memo.len()];
+    if let Some(&v) = shard.lock().unwrap().get(&key) {
+        return v;
+    }
+    let p = b.turn();
+    let n = b.pits_per_side();
+    let store_before = b.store(p) as i16;
+    let mut best = i16::MIN;
+    for i in 0..n {
+        if b.cells()[b.pit_global(p, i)] == 0 {
+            continue;
+        }
+        let r = b.apply(rules, i);
+        let gain = r.board.store(p) as i16 - store_before;
+        let child = solve_g(&r.board, rules, memo);
+        let v = if r.extra_turn { gain + child } else { gain - child };
+        best = best.max(v);
+    }
+    shard.lock().unwrap().insert(key, best);
+    best
+}
 
 /// `C(n, k)` for small `n`, computed with a `u128` accumulator to avoid overflow.
 fn binom(n: u64, k: u64) -> u64 {
@@ -113,27 +172,65 @@ impl Tablebase {
         2 * num_layouts(cap as u64, 2 * pits_per_side as u64)
     }
 
-    /// Build the tablebase for every layout with ≤ `cap` seeds in play.
+    /// Build the tablebase for every layout with ≤ `cap` seeds in play, using
+    /// all available cores.
     pub fn build(rules: Rules, pits_per_side: usize, cap: u32) -> Tablebase {
         let m = 2 * pits_per_side;
-        let total = num_layouts(cap as u64, m as u64);
-        let mut data = vec![0i16; 2 * total as usize];
+        let total = num_layouts(cap as u64, m as u64) as usize;
 
-        // Reuse the verified lazy `g` (memoised) to fill every layout.
-        let mut eg = Endgame::new(rules, cap);
+        // Fill a sharded, store-independent `g` memo in parallel. Each thread
+        // owns the (layout, side) pairs whose enumeration index is `≡ t`.
+        let memo: Vec<Mutex<U128Map<i16>>> =
+            (0..BUILD_SHARDS).map(|_| Mutex::new(U128Map::default())).collect();
+        let nthreads = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1)
+            .clamp(1, 8);
+
+        std::thread::scope(|scope| {
+            let memo = &memo;
+            for t in 0..nthreads {
+                scope.spawn(move || {
+                    let mut pits = vec![0u8; m];
+                    let mut idx = 0usize;
+                    Self::for_each_layout(cap, &mut pits, &mut |layout| {
+                        for side in 0..2u8 {
+                            if idx % nthreads == t {
+                                let board = layout_board(pits_per_side, layout, side);
+                                solve_g(&board, &rules, memo);
+                            }
+                            idx += 1;
+                        }
+                    });
+                });
+            }
+        });
+
+        // Transcribe the memo into the dense, rank-indexed array.
+        let mut data = vec![0i16; 2 * total];
         let mut pits = vec![0u8; m];
-        for side in 0..2u8 {
-            Self::for_each_layout(cap, &mut pits, &mut |layout| {
+        Self::for_each_layout(cap, &mut pits, &mut |layout| {
+            let r = rank(layout) as usize;
+            for side in 0..2u8 {
                 let board = layout_board(pits_per_side, layout, side);
-                let r = rank(layout);
-                data[side as usize * total as usize + r as usize] = eg.g(&board);
-            });
-        }
+                // Terminal layouts return before being memoised (their value is
+                // the immediate sweep); compute them directly here.
+                let v = if board.is_terminal() {
+                    let p = board.turn();
+                    board.pit_seeds(p) as i16 - board.pit_seeds(p.other()) as i16
+                } else {
+                    let key = g_key(&board);
+                    let shard = &memo[(mix(key) as usize) % BUILD_SHARDS];
+                    *shard.lock().unwrap().get(&key).expect("non-terminal memo filled")
+                };
+                data[side as usize * total + r] = v;
+            }
+        });
 
         Tablebase {
             pits_per_side,
             cap,
-            num_layouts: total,
+            num_layouts: total as u64,
             data,
         }
     }
@@ -244,6 +341,7 @@ fn layout_board(pits_per_side: usize, layout: &[u8], side: u8) -> Board {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::endgame::Endgame;
 
     #[test]
     fn rank_is_a_bijection() {
