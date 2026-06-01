@@ -105,17 +105,20 @@ PV annotations: `↻` marks a move that earns an extra turn, `×` marks a captur
 ### A note on exact solving and board size
 
 Exact solving is a full search to the end of the game (alpha-beta with a
-transposition table), so its cost grows steeply with board size. Approximate
-exact-solve times on this engine:
+store-independent transposition table, PVS, and an endgame table), so its cost
+grows steeply with board size. Approximate exact-solve times on this engine
+(`default` = lazy in-memory endgame; `--tb` = with a precomputed tablebase):
 
-| Board | Result (player 1) | Time |
-| --- | --- | --- |
-| Kalah(5,2) | win by 2 | <0.1 s |
-| Kalah(6,2) | win by 6 | <0.5 s |
-| Kalah(4,4) | win by 2 | ~1 s |
-| Kalah(5,3) | win by 6 | ~1 s |
-| Kalah(5,4) | win by 10 | ~17 s |
-| Kalah(6,3) | win by 2 | ~25 s |
+| Board | Result (player 1) | default | with `--tb` |
+| --- | --- | --- | --- |
+| Kalah(5,2) | win by 2 | <0.1 s | <0.1 s |
+| Kalah(6,2) | win by 6 | <0.5 s | <0.5 s |
+| Kalah(4,4) | win by 2 | ~1 s | ~1 s |
+| Kalah(5,3) | win by 6 | ~1 s | ~1 s |
+| Kalah(5,4) | win by 10 | ~11 s | ~7 s |
+| Kalah(6,3) | win by 2 | ~23 s | ~5 s |
+
+(A tablebase is a one-time offline build — see below — then reused across runs.)
 
 Larger boards (e.g. the classic Kalah(6,4)) exceed the default node budget and
 automatically fall back to the depth-limited **heuristic** search, which is
@@ -128,16 +131,47 @@ inferior moves are shown as a bound (e.g. `≤ +2 seeds`) because the solver
 proves they cannot beat the best move rather than spending time computing their
 exact value.
 
+## Endgame tablebases
+
+The cost of an exact solve is dominated by positions with many seeds still in
+play. A key fact lets us shortcut the rest: a position's optimal margin is
+`(my_store − opp_store) + g(pits, side)`, where the *future* differential `g`
+depends only on the pit layout and side to move — not on the seeds already
+banked. So once few enough seeds remain, the answer is a banked-score difference
+plus a `g` lookup.
+
+You can precompute `g` for **every** layout up to a seed cap into an offline
+tablebase file, then reuse it across runs (and across board *fills* — the same
+table serves Kalah(6,2), (6,3), (6,4), … since they share a board size):
+
+```sh
+# Build once (offline): all layouts with <= 14 seeds in play on a 6-pit board.
+mancala-solver gen-tb --pits 6 --seeds-cap 14 --out kalah6.tb     # ~35 s, ~37 MB
+
+# Reuse on any 6-pit position: endgame positions become O(1) array lookups.
+mancala-solver start --pits 6 --seeds 3 --tb kalah6.tb
+```
+
+On the proxy boards this roughly halves-to-fifths the solve time on top of the
+in-memory endgame (e.g. Kalah(6,3) ~25 s → ~5 s, Kalah(5,4) ~17 s → ~7 s). The
+file is a flat array indexed by a combinatorial rank of the layout, so no keys
+are stored on disk. When no `--tb` is given, a smaller endgame table is built
+lazily in memory for the duration of the search.
+
 ## Project layout
 
 The engine is a UI-independent library (`mancala`) so a future GUI/web front-end
 can reuse it:
 
 - `src/board.rs` — board representation, rules, move generation/application.
-- `src/solver.rs` — alpha-beta solver with transposition table, node budget, and
-  heuristic fallback; position analysis.
+- `src/solver.rs` — alpha-beta solver (PVS + history ordering), a
+  store-independent transposition table, node budget, and heuristic fallback;
+  position analysis.
+- `src/endgame.rs` — lazily-built, store-independent in-memory endgame table.
+- `src/tablebase.rs` — offline endgame tablebase: build, save, load, lookup.
+- `src/hash.rs` — fast `u128`-key hasher shared by the TT and endgame tables.
 - `src/notation.rs` — board-notation parsing/formatting.
-- `src/main.rs` — the `mancala-solver` CLI.
+- `src/main.rs` — the `mancala-solver` CLI (`analyze`, `start`, `gen-tb`).
 
 ## Tests
 

@@ -6,11 +6,13 @@
 //!
 //! See `--help` for the full option list.
 
+use std::path::Path;
 use std::process::ExitCode;
 
 use mancala::board::{Board, Player, Rules};
 use mancala::notation;
-use mancala::solver::{analyze, Analysis, MoveEval, Outcome};
+use mancala::solver::{analyze_with_tb, Analysis, MoveEval, Outcome};
+use mancala::tablebase::Tablebase;
 
 const DEFAULT_BUDGET: u64 = 20_000_000;
 const DEFAULT_FALLBACK_DEPTH: u32 = 11;
@@ -36,6 +38,7 @@ fn run(args: &[String]) -> Result<(), String> {
         }
         Some("analyze") => cmd_analyze(&args[1..]),
         Some("start") => cmd_start(&args[1..]),
+        Some("gen-tb") => cmd_gen_tb(&args[1..]),
         Some(other) => Err(format!("unknown command '{other}'")),
     }
 }
@@ -46,6 +49,7 @@ struct CommonOpts {
     budget: u64,
     fallback_depth: u32,
     rules: Rules,
+    tb_path: Option<String>,
 }
 
 impl Default for CommonOpts {
@@ -55,6 +59,7 @@ impl Default for CommonOpts {
             budget: DEFAULT_BUDGET,
             fallback_depth: DEFAULT_FALLBACK_DEPTH,
             rules: Rules::default(),
+            tb_path: None,
         }
     }
 }
@@ -90,6 +95,10 @@ fn parse_common(flag: &str, iter: &mut std::slice::Iter<'_, String>, opts: &mut 
             opts.rules.capture_requires_nonempty_opposite = false;
             Ok(true)
         }
+        "--tb" => {
+            opts.tb_path = Some(take_value(flag, iter)?.to_string());
+            Ok(true)
+        }
         _ => Ok(false),
     }
 }
@@ -119,8 +128,7 @@ fn cmd_analyze(args: &[String]) -> Result<(), String> {
 
     let board_str = board_str.ok_or("analyze requires --board \"<notation>\"")?;
     let board = notation::parse(&board_str, opts.turn)?;
-    report(&board, &opts);
-    Ok(())
+    report(&board, &opts)
 }
 
 fn cmd_start(args: &[String]) -> Result<(), String> {
@@ -149,19 +157,91 @@ fn cmd_start(args: &[String]) -> Result<(), String> {
     }
 
     let board = Board::start(pits, seeds, opts.turn)?;
-    report(&board, &opts);
-    Ok(())
+    report(&board, &opts)
 }
 
-fn report(board: &Board, opts: &CommonOpts) {
+fn report(board: &Board, opts: &CommonOpts) -> Result<(), String> {
     println!("{}", render_board(board));
     println!("Notation:    {}", notation::format(board));
     println!("Side to move: {}", board.turn());
     println!("Rules:        capture requires non-empty opposite pit = {}", opts.rules.capture_requires_nonempty_opposite);
+
+    // Load an optional endgame tablebase.
+    let tb = match &opts.tb_path {
+        Some(path) => {
+            let tb = Tablebase::load(Path::new(path))
+                .map_err(|e| format!("failed to load tablebase '{path}': {e}"))?;
+            if tb.pits_per_side() != board.pits_per_side() {
+                return Err(format!(
+                    "tablebase is for {}-pit boards, but this board has {} pits per side",
+                    tb.pits_per_side(),
+                    board.pits_per_side()
+                ));
+            }
+            println!("Tablebase:    {path} (cap {} seeds in play)", tb.cap());
+            Some(tb)
+        }
+        None => None,
+    };
     println!();
 
-    let analysis = analyze(board, opts.rules, opts.budget, opts.fallback_depth);
+    let analysis = analyze_with_tb(board, opts.rules, opts.budget, opts.fallback_depth, tb.as_ref());
     println!("{}", render_analysis(board, &analysis));
+    Ok(())
+}
+
+fn cmd_gen_tb(args: &[String]) -> Result<(), String> {
+    let mut pits: usize = 6;
+    let mut cap: u32 = 12;
+    let mut out: Option<String> = None;
+    let mut rules = Rules::default();
+
+    let mut iter = args.iter();
+    while let Some(arg) = iter.next() {
+        match arg.as_str() {
+            "--pits" => {
+                pits = take_value(arg, &mut iter)?
+                    .parse()
+                    .map_err(|_| "--pits must be a positive integer".to_string())?
+            }
+            "--seeds-cap" => {
+                cap = take_value(arg, &mut iter)?
+                    .parse()
+                    .map_err(|_| "--seeds-cap must be a non-negative integer".to_string())?
+            }
+            "--out" | "-o" => out = Some(take_value(arg, &mut iter)?.to_string()),
+            "--capture-empty" => rules.capture_requires_nonempty_opposite = false,
+            other => return Err(format!("unknown flag '{other}' for 'gen-tb'")),
+        }
+    }
+
+    let out = out.ok_or("gen-tb requires --out <file>")?;
+    if pits == 0 {
+        return Err("--pits must be at least 1".to_string());
+    }
+
+    // Guard against accidentally enormous tables.
+    let entries = Tablebase::entry_count(pits, cap);
+    let bytes = entries * 2;
+    const MAX_BYTES: u64 = 4 * 1024 * 1024 * 1024; // 4 GiB
+    if bytes > MAX_BYTES {
+        return Err(format!(
+            "tablebase for pits={pits} seeds-cap={cap} would be {} entries (~{:.1} GiB) — too large; lower --seeds-cap",
+            entries,
+            bytes as f64 / (1024.0 * 1024.0 * 1024.0)
+        ));
+    }
+
+    println!(
+        "Building tablebase: pits={pits} seeds-cap={cap} ({} entries, ~{:.1} MiB)...",
+        entries,
+        bytes as f64 / (1024.0 * 1024.0)
+    );
+    let tb = Tablebase::build(rules, pits, cap);
+    tb.save(Path::new(&out))
+        .map_err(|e| format!("failed to write '{out}': {e}"))?;
+    println!("Wrote {out}");
+    Ok(())
 }
 
 /// Render the board as a classic two-row Kalah diagram.
@@ -336,6 +416,7 @@ USAGE:
 COMMANDS:
     analyze   Analyze a position given in board notation
     start     Analyze the standard opening for a given board size
+    gen-tb    Build an offline endgame tablebase and write it to disk
     help      Show this help
 
 ANALYZE:
@@ -351,13 +432,21 @@ ANALYZE:
 START:
     mancala-solver start --pits 6 --seeds 4 [OPTIONS]
 
-OPTIONS (both commands):
+GEN-TB:
+    mancala-solver gen-tb --pits 6 --seeds-cap 14 --out kalah6.tb [--capture-empty]
+
+    Precomputes exact endgame values for every pit layout with up to
+    <seeds-cap> seeds in play, writing a tablebase file. Pass it to analyze/start
+    with --tb to make those endgame positions O(1) lookups.
+
+OPTIONS (analyze & start):
     --turn <0|1>        Side to move (0 = P0/South, 1 = P1/North). Default: 0
     --budget <N>        Exact-search node budget before falling back to the
                         heuristic search. Default: {budget}
     --depth <D>         Heuristic fallback search depth in plies. Default: {depth}
     --capture-empty     Allow captures even when the opposite pit is empty
                         (default: captures require a non-empty opposite pit)
+    --tb <file>         Use a precomputed endgame tablebase (see gen-tb)
 
 OUTPUT:
     A board diagram, the exact result (or heuristic estimate), the best move,

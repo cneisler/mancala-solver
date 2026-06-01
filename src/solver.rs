@@ -15,6 +15,7 @@
 use crate::board::{Board, Player, Rules, MAX_PITS};
 use crate::endgame::Endgame;
 use crate::hash::U128Map;
+use crate::tablebase::Tablebase;
 
 /// Weight applied to a stored seed in the heuristic evaluation (and to the
 /// terminal margin in depth-limited mode, so terminal results dominate).
@@ -129,28 +130,33 @@ type TtMap = U128Map<TtEntry>;
 /// prunes.
 const ENDGAME_CUTOFF: u32 = 14;
 
-struct Searcher {
+struct Searcher<'a> {
     rules: Rules,
     tt: TtMap,
     tt_cap: usize,
     /// History heuristic: cumulative beta-cutoff weight per `[side][pit]`, used
     /// to order quiet moves. Coarse (only 2 × MAX_PITS buckets) but cheap.
     history: [[u32; MAX_PITS]; 2],
-    /// Store-independent endgame table (used in exact mode only).
+    /// Lazily-built in-memory endgame table (used in exact mode when no
+    /// precomputed tablebase is supplied).
     endgame: Endgame,
+    /// Optional precomputed offline tablebase; when present it overrides the
+    /// lazy endgame for positions within its seed cap.
+    tb: Option<&'a Tablebase>,
     nodes: u64,
     budget: u64,
     aborted: bool,
 }
 
-impl Searcher {
-    fn new(rules: Rules, budget: u64, endgame_cutoff: u32) -> Searcher {
+impl<'a> Searcher<'a> {
+    fn new(rules: Rules, budget: u64, endgame_cutoff: u32, tb: Option<&'a Tablebase>) -> Searcher<'a> {
         Searcher {
             rules,
             tt: TtMap::default(),
             tt_cap: TT_MAX_ENTRIES,
             history: [[0; MAX_PITS]; 2],
             endgame: Endgame::new(rules, endgame_cutoff),
+            tb,
             nodes: 0,
             budget,
             aborted: false,
@@ -296,10 +302,20 @@ impl Searcher {
         }
         // Exact-mode endgame cutoff: once few seeds remain in play, the exact
         // margin is the banked store difference plus the store-independent `g`.
-        if depth.is_none() && b.seeds_in_play() <= self.endgame.cutoff() {
-            let p = b.turn();
-            let store_diff = b.store(p) as i32 - b.store(p.other()) as i32;
-            return store_diff + self.endgame.g(b) as i32;
+        // A precomputed tablebase (O(1) lookup) takes priority over the lazy one.
+        if depth.is_none() {
+            let t = b.seeds_in_play();
+            if let Some(tb) = self.tb {
+                if t <= tb.cap() {
+                    let p = b.turn();
+                    let sd = b.store(p) as i32 - b.store(p.other()) as i32;
+                    return sd + tb.lookup(b).expect("position within tablebase cap") as i32;
+                }
+            } else if t <= self.endgame.cutoff() {
+                let p = b.turn();
+                let sd = b.store(p) as i32 - b.store(p.other()) as i32;
+                return sd + self.endgame.g(b) as i32;
+            }
         }
         if depth == Some(0) {
             return self.heuristic(b);
@@ -538,22 +554,39 @@ const ENDGAME_MIN_BUDGET: u64 = 50_000_000;
 /// is exceeded, fall back to a depth-limited heuristic search of
 /// `fallback_depth` plies.
 pub fn analyze(board: &Board, rules: Rules, node_budget: u64, fallback_depth: u32) -> Analysis {
-    // Enable the endgame table only for small boards under a real exact budget;
-    // a cutoff of 0 disables it (no non-terminal position has 0 seeds in play).
-    let endgame_cutoff = if board.pits_per_side() <= ENDGAME_MAX_PITS && node_budget >= ENDGAME_MIN_BUDGET {
+    analyze_with_tb(board, rules, node_budget, fallback_depth, None)
+}
+
+/// Like [`analyze`], but consulting a precomputed offline [`Tablebase`] for the
+/// endgame. The tablebase is used only if its board size matches `board`.
+pub fn analyze_with_tb(
+    board: &Board,
+    rules: Rules,
+    node_budget: u64,
+    fallback_depth: u32,
+    tb: Option<&Tablebase>,
+) -> Analysis {
+    let tb = tb.filter(|t| t.pits_per_side() == board.pits_per_side());
+
+    // With a tablebase, the endgame cutoff is the tablebase's own cap. Otherwise
+    // enable the lazy endgame only for small boards under a real exact budget
+    // (a cutoff of 0 disables it: no non-terminal position has 0 seeds in play).
+    let endgame_cutoff = if tb.is_some() {
+        0
+    } else if board.pits_per_side() <= ENDGAME_MAX_PITS && node_budget >= ENDGAME_MIN_BUDGET {
         ENDGAME_CUTOFF
     } else {
         0
     };
 
-    let mut exact = Searcher::new(rules, node_budget, endgame_cutoff);
+    let mut exact = Searcher::new(rules, node_budget, endgame_cutoff, tb);
     let result = exact.analyze_root(board, None);
     if !exact.aborted {
         return result;
     }
 
     // Exact search ran out of budget — fall back to a heuristic search.
-    let mut limited = Searcher::new(rules, u64::MAX, 0);
+    let mut limited = Searcher::new(rules, u64::MAX, 0, None);
     limited.analyze_root(board, Some(fallback_depth))
 }
 

@@ -15,6 +15,7 @@ pub mod endgame;
 pub mod hash;
 pub mod notation;
 pub mod solver;
+pub mod tablebase;
 
 pub use board::{Board, MoveResult, Player, Rules};
 pub use solver::{analyze, Analysis, MoveEval};
