@@ -114,8 +114,8 @@ exact-solve times on this engine:
 | Kalah(6,2) | win by 6 | <0.5 s |
 | Kalah(4,4) | win by 2 | ~1 s |
 | Kalah(5,3) | win by 6 | ~1 s |
-| Kalah(5,4) | win by 10 | ~35 s |
-| Kalah(6,3) | win by 2 | ~33 s |
+| Kalah(5,4) | win by 10 | ~17 s |
+| Kalah(6,3) | win by 2 | ~25 s |
 
 Larger boards (e.g. the classic Kalah(6,4)) exceed the default node budget and
 automatically fall back to the depth-limited **heuristic** search, which is

@@ -12,10 +12,9 @@
 //! move). Heuristic values use an internal scale dominated by the store
 //! difference and are not directly comparable to exact seed margins.
 
-use std::collections::HashMap;
-use std::hash::{BuildHasherDefault, Hasher};
-
 use crate::board::{Board, Player, Rules, MAX_PITS};
+use crate::endgame::Endgame;
+use crate::hash::U128Map;
 
 /// Weight applied to a stored seed in the heuristic evaluation (and to the
 /// terminal margin in depth-limited mode, so terminal results dominate).
@@ -122,29 +121,13 @@ const CELL_BITS: u32 = 6;
 /// to let a full Kalah(6,4) solve fit in memory on a 16 GB host.
 const TT_MAX_ENTRIES: usize = 180_000_000;
 
-/// A fast hasher for the already-well-distributed packed `u128` TT keys. The
-/// `HashMap` still stores the full key, so a hash collision only costs a probe,
-/// never correctness.
-#[derive(Default)]
-struct U128Hasher(u64);
+type TtMap = U128Map<TtEntry>;
 
-impl Hasher for U128Hasher {
-    fn finish(&self) -> u64 {
-        self.0
-    }
-    fn write(&mut self, _bytes: &[u8]) {
-        // Keys are fed via `write_u128`; this path is unused.
-    }
-    fn write_u128(&mut self, i: u128) {
-        let mut h = (i as u64) ^ ((i >> 64) as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
-        h ^= h >> 32;
-        h = h.wrapping_mul(0xFF51_AFD7_ED55_8CCD);
-        h ^= h >> 29;
-        self.0 = h;
-    }
-}
-
-type TtMap = HashMap<u128, TtEntry, BuildHasherDefault<U128Hasher>>;
+/// Seeds-in-play threshold at or below which the exact search consults the
+/// store-independent endgame table instead of recursing. Chosen empirically as
+/// a balance between endgame-table size and how much of the forward tree it
+/// prunes.
+const ENDGAME_CUTOFF: u32 = 14;
 
 struct Searcher {
     rules: Rules,
@@ -153,18 +136,21 @@ struct Searcher {
     /// History heuristic: cumulative beta-cutoff weight per `[side][pit]`, used
     /// to order quiet moves. Coarse (only 2 × MAX_PITS buckets) but cheap.
     history: [[u32; MAX_PITS]; 2],
+    /// Store-independent endgame table (used in exact mode only).
+    endgame: Endgame,
     nodes: u64,
     budget: u64,
     aborted: bool,
 }
 
 impl Searcher {
-    fn new(rules: Rules, budget: u64) -> Searcher {
+    fn new(rules: Rules, budget: u64, endgame_cutoff: u32) -> Searcher {
         Searcher {
             rules,
             tt: TtMap::default(),
             tt_cap: TT_MAX_ENTRIES,
             history: [[0; MAX_PITS]; 2],
+            endgame: Endgame::new(rules, endgame_cutoff),
             nodes: 0,
             budget,
             aborted: false,
@@ -280,6 +266,13 @@ impl Searcher {
                 None => m,
                 Some(_) => m * STORE_WEIGHT,
             };
+        }
+        // Exact-mode endgame cutoff: once few seeds remain in play, the exact
+        // margin is the banked store difference plus the store-independent `g`.
+        if depth.is_none() && b.seeds_in_play() <= self.endgame.cutoff() {
+            let p = b.turn();
+            let store_diff = b.store(p) as i32 - b.store(p.other()) as i32;
+            return store_diff + self.endgame.g(b) as i32;
         }
         if depth == Some(0) {
             return self.heuristic(b);
@@ -493,18 +486,35 @@ impl Searcher {
     }
 }
 
+/// Largest board (pits per side) for which the endgame table is worthwhile: its
+/// `≤ ENDGAME_CUTOFF`-seed config space stays bounded. Bigger boards have an
+/// explosive endgame space, so they skip it.
+const ENDGAME_MAX_PITS: usize = 6;
+
+/// Only build the endgame table when the caller has committed to a substantial
+/// exact search; small-budget probing attempts skip it so they stay cheap.
+const ENDGAME_MIN_BUDGET: u64 = 50_000_000;
+
 /// Analyze `board`: attempt an exact solve within `node_budget`; if that budget
 /// is exceeded, fall back to a depth-limited heuristic search of
 /// `fallback_depth` plies.
 pub fn analyze(board: &Board, rules: Rules, node_budget: u64, fallback_depth: u32) -> Analysis {
-    let mut exact = Searcher::new(rules, node_budget);
+    // Enable the endgame table only for small boards under a real exact budget;
+    // a cutoff of 0 disables it (no non-terminal position has 0 seeds in play).
+    let endgame_cutoff = if board.pits_per_side() <= ENDGAME_MAX_PITS && node_budget >= ENDGAME_MIN_BUDGET {
+        ENDGAME_CUTOFF
+    } else {
+        0
+    };
+
+    let mut exact = Searcher::new(rules, node_budget, endgame_cutoff);
     let result = exact.analyze_root(board, None);
     if !exact.aborted {
         return result;
     }
 
     // Exact search ran out of budget — fall back to a heuristic search.
-    let mut limited = Searcher::new(rules, u64::MAX);
+    let mut limited = Searcher::new(rules, u64::MAX, 0);
     limited.analyze_root(board, Some(fallback_depth))
 }
 

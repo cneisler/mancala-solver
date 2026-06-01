@@ -204,6 +204,24 @@ impl Board {
         self.side_empty(Player::P0) || self.side_empty(Player::P1)
     }
 
+    /// Total number of seeds currently in pits (i.e. not yet banked in a store).
+    /// This is non-increasing as the game progresses.
+    pub fn seeds_in_play(&self) -> u32 {
+        let mut total = 0u32;
+        for i in 0..self.pits_per_side {
+            total += self.cells[self.pit_global(Player::P0, i)] as u32;
+            total += self.cells[self.pit_global(Player::P1, i)] as u32;
+        }
+        total
+    }
+
+    /// Total seeds in player `p`'s pits (excludes their store).
+    pub fn pit_seeds(&self, p: Player) -> u32 {
+        (0..self.pits_per_side)
+            .map(|i| self.cells[self.pit_global(p, i)] as u32)
+            .sum()
+    }
+
     /// Legal moves for player `p`: indices `0..pits_per_side` of non-empty pits.
     pub fn legal_moves(&self, p: Player) -> Vec<usize> {
         (0..self.pits_per_side)
