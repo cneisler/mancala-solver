@@ -165,6 +165,7 @@ fn cmd_start(args: &[String]) -> Result<(), String> {
     let mut opts = CommonOpts::default();
     let mut pits: usize = 6;
     let mut seeds: u8 = 4;
+    let mut moves: Vec<usize> = Vec::new();
 
     let mut iter = args.iter();
     while let Some(arg) = iter.next() {
@@ -182,12 +183,56 @@ fn cmd_start(args: &[String]) -> Result<(), String> {
                     .parse()
                     .map_err(|_| "--seeds must be 0..=255".to_string())?
             }
+            // A sequence of 0-based pit indices to play from the opening, applied
+            // to whichever side is to move (extra-turn moves keep the same side).
+            "--moves" => {
+                for tok in take_value(arg, &mut iter)?.split([',', ' ']).filter(|t| !t.is_empty()) {
+                    moves.push(
+                        tok.parse()
+                            .map_err(|_| format!("--moves: '{tok}' is not a pit index"))?,
+                    );
+                }
+            }
             other => return Err(format!("unknown flag '{other}' for 'start'")),
         }
     }
 
-    let board = Board::start(pits, seeds, opts.turn)?;
+    let mut board = Board::start(pits, seeds, opts.turn)?;
+    if !moves.is_empty() {
+        board = play_moves(&board, &moves, &opts.rules)?;
+    }
     report(&board, &opts)
+}
+
+/// Apply a sequence of pit moves from `board`, printing each, and return the
+/// resulting position. Errors on an illegal move.
+fn play_moves(board: &Board, moves: &[usize], rules: &Rules) -> Result<Board, String> {
+    let mut cur = *board;
+    println!("Move sequence:");
+    for (k, &mv) in moves.iter().enumerate() {
+        if cur.is_terminal() {
+            return Err(format!("move {} (pit {mv}): game already over", k + 1));
+        }
+        if mv >= cur.pits_per_side() || cur.cells()[cur.pit_global(cur.turn(), mv)] == 0 {
+            return Err(format!(
+                "move {} (pit {mv}) is illegal for {} in position {}",
+                k + 1,
+                cur.turn(),
+                notation::format(&cur)
+            ));
+        }
+        let mover = cur.turn();
+        let r = cur.apply(rules, mv);
+        let tag = match (r.extra_turn, r.captured) {
+            (true, _) => " (extra turn)",
+            (_, true) => " (capture)",
+            _ => "",
+        };
+        println!("  {}. {mover} plays pit {mv}{tag}", k + 1);
+        cur = r.board;
+    }
+    println!();
+    Ok(cur)
 }
 
 fn report(board: &Board, opts: &CommonOpts) -> Result<(), String> {
@@ -522,7 +567,11 @@ ANALYZE:
         mancala-solver analyze --board "4,4,4,4,4,4,0 | 4,4,4,4,4,4,0"
 
 START:
-    mancala-solver start --pits 6 --seeds 4 [OPTIONS]
+    mancala-solver start --pits 6 --seeds 4 [--moves 2,5,1,0] [OPTIONS]
+
+    --moves applies a sequence of 0-based pit indices from the opening (to
+    whichever side is to move; extra-turn moves keep the same side), then
+    analyzes the resulting position.
 
 GEN-TB:
     mancala-solver gen-tb --pits 6 --seeds-cap 14 --out kalah6.tb [--capture-empty]
