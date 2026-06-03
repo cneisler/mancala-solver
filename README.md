@@ -40,6 +40,33 @@ cargo build --release
 The binary is `target/release/mancala-solver`. There are no external
 dependencies.
 
+## Web UI (runs in the browser, no server)
+
+The engine also compiles to **WebAssembly**, so it runs entirely client-side —
+an interactive board where you play moves and the solver shows the exact result,
+best move, per-move table, and principal variation. Everything in [`docs/`](docs/)
+is a static site (HTML/CSS/JS + a ~78 KB `mancala.wasm`).
+
+Try it locally:
+
+```sh
+docs/build.sh                 # rebuild docs/mancala.wasm from the engine
+python3 -m http.server -d docs 8000   # then open http://localhost:8000
+```
+
+**Free hosting on GitHub Pages:** in the repo, *Settings → Pages → Build and
+deployment → Source: Deploy from a branch*, then pick your branch and the
+`/docs` folder. GitHub serves it (with the correct `application/wasm` type) at
+`https://<user>.github.io/mancala-solver/`. No build step or server needed — the
+prebuilt wasm is committed; rerun `docs/build.sh` to refresh it after engine
+changes.
+
+In the browser the solver uses the in-memory search with a node **budget**
+(selectable); positions it can't finish exactly within the budget fall back to a
+clearly-labelled heuristic estimate. (The large offline tablebases aren't shipped
+to the browser — they'd be too big — so very hard positions like Kalah(6,4) from
+the opening show a heuristic rather than an exact value.)
+
 ## Usage
 
 ### Analyze a position from board notation

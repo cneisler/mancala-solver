@@ -1,0 +1,73 @@
+:root {
+  --bg: #1b1d23;
+  --panel: #262a33;
+  --pit: #3a4150;
+  --pit-move: #4a5878;
+  --store: #2f3543;
+  --accent: #7cc4ff;
+  --best: #5fd08a;
+  --text: #e6e8ec;
+  --muted: #9aa3b2;
+}
+* { box-sizing: border-box; }
+body {
+  margin: 0;
+  font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
+  background: var(--bg);
+  color: var(--text);
+  line-height: 1.5;
+}
+header, main, footer { max-width: 880px; margin: 0 auto; padding: 0 16px; }
+header { padding-top: 24px; }
+h1 { margin: 0; font-size: 1.6rem; letter-spacing: 0.5px; }
+.tag { color: var(--muted); margin: 4px 0 16px; }
+.controls, .actions {
+  display: flex; flex-wrap: wrap; gap: 12px; align-items: center; margin: 16px 0;
+}
+label { color: var(--muted); font-size: 0.9rem; display: inline-flex; gap: 6px; align-items: center; }
+input[type=number] { width: 56px; }
+input, select, button { font: inherit; }
+button {
+  background: var(--accent); color: #06223b; border: 0; border-radius: 8px;
+  padding: 8px 14px; cursor: pointer; font-weight: 600;
+}
+button:disabled { opacity: 0.45; cursor: default; }
+button.secondary { background: var(--pit); color: var(--text); }
+
+/* Board: two rows of pits, stores on the ends. */
+.board {
+  background: var(--panel); border-radius: 16px; padding: 16px;
+  display: grid; grid-template-columns: auto 1fr auto; gap: 14px; align-items: center;
+}
+.store {
+  background: var(--store); border-radius: 14px; min-width: 64px; min-height: 150px;
+  display: flex; flex-direction: column; align-items: center; justify-content: center;
+}
+.store .count { font-size: 1.8rem; font-weight: 700; }
+.store .who { color: var(--muted); font-size: 0.75rem; margin-top: 4px; }
+.rows { display: flex; flex-direction: column; gap: 12px; }
+.row { display: grid; gap: 10px; grid-auto-flow: column; }
+.pit {
+  background: var(--pit); border: 2px solid transparent; border-radius: 12px;
+  min-height: 64px; display: flex; flex-direction: column; align-items: center;
+  justify-content: center; position: relative;
+}
+.pit .count { font-size: 1.3rem; font-weight: 700; }
+.pit .lot { position: absolute; top: 3px; left: 6px; font-size: 0.65rem; color: var(--muted); }
+.pit.playable { background: var(--pit-move); cursor: pointer; }
+.pit.playable:hover { border-color: var(--accent); }
+.pit.best { border-color: var(--best); box-shadow: 0 0 0 2px var(--best) inset; }
+
+.turn { color: var(--muted); }
+.result { background: var(--panel); border-radius: 12px; padding: 14px 16px; min-height: 24px; margin-top: 8px; }
+.result.win { border-left: 4px solid var(--best); }
+.result.loss { border-left: 4px solid #e06c75; }
+.result.draw { border-left: 4px solid var(--muted); }
+.verdict { font-size: 1.15rem; font-weight: 700; margin: 0 0 8px; }
+.evals { display: grid; grid-template-columns: auto auto 1fr; gap: 2px 10px; font-variant-numeric: tabular-nums; }
+.evals .b { color: var(--best); font-weight: 700; }
+.pv { color: var(--muted); margin-top: 10px; word-spacing: 2px; }
+.hint { color: var(--muted); font-size: 0.85rem; }
+footer { color: var(--muted); font-size: 0.85rem; padding: 24px 16px 40px; }
+footer a { color: var(--accent); }
+.err { color: #e06c75; }

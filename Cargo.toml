@@ -8,6 +8,8 @@ license = "MIT"
 [lib]
 name = "mancala"
 path = "src/lib.rs"
+# rlib for the CLI/tests; cdylib so the wasm32 build emits a loadable `.wasm`.
+crate-type = ["rlib", "cdylib"]
 
 [[bin]]
 name = "mancala-solver"
