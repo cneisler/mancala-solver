@@ -288,7 +288,17 @@ impl Tablebase {
 
     /// Load a tablebase from `path`.
     pub fn load(path: &Path) -> io::Result<Tablebase> {
-        let mut r = BufReader::new(File::open(path)?);
+        Self::from_reader(BufReader::new(File::open(path)?))
+    }
+
+    /// Load a tablebase from an in-memory byte slice (e.g. a `fetch`ed file in
+    /// the browser, where there is no filesystem).
+    pub fn from_bytes(bytes: &[u8]) -> io::Result<Tablebase> {
+        Self::from_reader(std::io::Cursor::new(bytes))
+    }
+
+    /// Parse a tablebase from any reader (see the file-format docs above).
+    pub fn from_reader<R: Read>(mut r: R) -> io::Result<Tablebase> {
         let mut magic = [0u8; 8];
         r.read_exact(&mut magic)?;
         if &magic != MAGIC {

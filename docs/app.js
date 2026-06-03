@@ -3,6 +3,21 @@
 
 let wasm = null;
 
+// Fetch the bundled 6-pit endgame tablebase and hand it to the engine. Returns
+// true on success. It only applies to 6-pit boards; other sizes ignore it.
+async function loadTb() {
+  try {
+    const bytes = new Uint8Array(await (await fetch("kalah6.bin")).arrayBuffer());
+    const ptr = wasm.wasm_alloc(bytes.length);
+    new Uint8Array(wasm.memory.buffer, ptr, bytes.length).set(bytes);
+    const ok = wasm.wasm_set_tb(ptr, bytes.length);
+    wasm.wasm_dealloc(ptr, bytes.length);
+    return ok === 1;
+  } catch {
+    return false;
+  }
+}
+
 async function loadWasm() {
   // Prefer streaming; fall back to ArrayBuffer if the host serves the wasm with
   // the wrong MIME type (some static hosts do).
@@ -243,7 +258,10 @@ function undo() {
 (async function () {
   try {
     await loadWasm();
-    document.getElementById("status").textContent = "engine ready";
+    const tbOk = await loadTb();
+    document.getElementById("status").textContent = tbOk
+      ? "engine ready · 6-pit endgame tablebase loaded (≤11 seeds solved instantly)"
+      : "engine ready";
     document.getElementById("newGame").onclick = newGame;
     document.getElementById("undo").onclick = undo;
     document.getElementById("analyze").onclick = analyze;

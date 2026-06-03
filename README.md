@@ -62,10 +62,14 @@ prebuilt wasm is committed; rerun `docs/build.sh` to refresh it after engine
 changes.
 
 In the browser the solver uses the in-memory search with a node **budget**
-(selectable); positions it can't finish exactly within the budget fall back to a
-clearly-labelled heuristic estimate. (The large offline tablebases aren't shipped
-to the browser — they'd be too big — so very hard positions like Kalah(6,4) from
-the opening show a heuristic rather than an exact value.)
+(selectable). A small **6-pit endgame tablebase** (`docs/kalah6.bin`, ~5 MB,
+≤ 11 seeds in play) ships with the page and is loaded on startup, so 6-pit
+endgames are solved **exactly and instantly** and mid-game positions resolve
+exactly far more often. Positions still too big for the budget (e.g. Kalah(6,4)
+straight from the opening) fall back to a clearly-labelled heuristic estimate —
+the multi-hundred-MB high-cap tablebases that would solve those aren't shipped to
+the browser. Rebuild the bundled table with
+`mancala-solver gen-tb --pits 6 --seeds-cap 11 --out docs/kalah6.bin`.
 
 ## Usage
 
