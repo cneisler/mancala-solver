@@ -428,7 +428,9 @@ impl<'a> Searcher<'a> {
     }
 
     /// Follow stored best moves to reconstruct the principal variation, starting
-    /// *from* `start`. Capped to avoid pathological loops.
+    /// *from* `start`. Uses the main transposition table above the endgame cutoff
+    /// and the tablebase (when present) within it, so the line extends to the end
+    /// of the game. Capped to avoid pathological loops.
     fn follow_pv(&self, start: &Board, depth: Option<u32>, cap: usize) -> Vec<usize> {
         let mut pv = Vec::new();
         let mut cur = *start;
@@ -437,18 +439,49 @@ impl<'a> Searcher<'a> {
             if d == Some(0) {
                 break;
             }
-            let Some(k) = Self::key(&cur, d) else { break };
-            let Some(entry) = self.tt.get(&k) else { break };
-            if entry.best == 255 {
-                break;
-            }
-            let mv = entry.best as usize;
+            // Prefer a best move stored in the main TT; otherwise (inside the
+            // endgame tablebase) derive it from the table.
+            let from_tt = Self::key(&cur, d)
+                .and_then(|k| self.tt.get(&k))
+                .and_then(|e| (e.best != 255).then_some(e.best as usize));
+            let mv = match from_tt.or_else(|| self.best_move_via_tb(&cur)) {
+                Some(mv) => mv,
+                None => break,
+            };
             pv.push(mv);
             let r = cur.apply(&self.rules, mv);
             cur = r.board;
             d = d.map(|x| x - 1);
         }
         pv
+    }
+
+    /// Best move at a position covered by the endgame tablebase, by evaluating
+    /// each child's `store_diff ± g`. `None` if there is no tablebase, the
+    /// position is outside its cap, or there are no moves.
+    fn best_move_via_tb(&self, b: &Board) -> Option<usize> {
+        let tb = self.tb?;
+        if b.seeds_in_play() > tb.cap() {
+            return None;
+        }
+        let p = b.turn();
+        let o = p.other();
+        let mut best_v = i32::MIN;
+        let mut best_m = None;
+        for i in 0..b.pits_per_side() {
+            if b.cells()[b.pit_global(p, i)] == 0 {
+                continue;
+            }
+            let r = b.apply(&self.rules, i);
+            let g = tb.lookup(&r.board)? as i32;
+            let sd = r.board.store(p) as i32 - r.board.store(o) as i32;
+            let v = if r.extra_turn { sd + g } else { sd - g };
+            if v > best_v {
+                best_v = v;
+                best_m = Some(i);
+            }
+        }
+        best_m
     }
 
     /// Solve the position with a single alpha-beta pass over the root moves.

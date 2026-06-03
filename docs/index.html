@@ -1,0 +1,58 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Mancala Solver</title>
+<link rel="stylesheet" href="style.css" />
+</head>
+<body>
+<header>
+  <h1>Mancala&nbsp;Solver</h1>
+  <p class="tag">Exact Kalah solver, running entirely in your browser (WebAssembly).</p>
+</header>
+
+<main>
+  <section class="controls">
+    <label>Pits/side <input id="pits" type="number" min="1" max="9" value="6" /></label>
+    <label>Seeds/pit <input id="seeds" type="number" min="0" max="20" value="4" /></label>
+    <label title="Allow a capture even when the opposite pit is empty">
+      <input id="captureEmpty" type="checkbox" /> capture-empty rule
+    </label>
+    <label title="Max search nodes before falling back to a heuristic estimate">
+      Budget <select id="budget">
+        <option value="2000000">2M (fast)</option>
+        <option value="20000000" selected>20M</option>
+        <option value="80000000">80M (slow)</option>
+      </select>
+    </label>
+    <button id="newGame">New game</button>
+    <button id="undo" disabled>Undo</button>
+  </section>
+
+  <section id="board" class="board" aria-label="Mancala board"></section>
+
+  <section class="actions">
+    <button id="analyze">Analyze</button>
+    <button id="playBest" disabled>Play best move</button>
+    <span id="turnLabel" class="turn"></span>
+  </section>
+
+  <section id="result" class="result"></section>
+
+  <p class="hint">
+    Click a pit on the side to move to play it. Extra-turn moves keep the same
+    side. <strong>Analyze</strong> shows the exact result (or a heuristic estimate
+    if the position is too big for the chosen budget), the best move, a per-move
+    table, and the principal variation.
+  </p>
+</main>
+
+<footer>
+  <span id="status">loading engine…</span> ·
+  <a href="https://github.com/cneisler/mancala-solver">source</a>
+</footer>
+
+<script type="module" src="app.js"></script>
+</body>
+</html>

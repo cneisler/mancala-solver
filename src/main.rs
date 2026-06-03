@@ -6,7 +6,7 @@
 //!
 //! See `--help` for the full option list.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use mancala::board::{Board, Player, Rules};
@@ -16,6 +16,17 @@ use mancala::tablebase::Tablebase;
 
 const DEFAULT_BUDGET: u64 = 20_000_000;
 const DEFAULT_FALLBACK_DEPTH: u32 = 11;
+
+/// Auto-tablebase is used by default for boards up to this many pits per side
+/// (bigger boards have an explosive endgame space).
+const AUTO_TB_MAX_PITS: usize = 6;
+/// ...and only when at least this many seeds are in play (small/easy positions
+/// solve instantly without one, so building a table would just be overhead).
+const AUTO_TB_MIN_SEEDS: u32 = 34;
+/// Default endgame seed cap for an auto-built tablebase.
+const AUTO_TB_CAP: u32 = 14;
+/// Refuse to auto-build a table larger than this many entries (~700 MB).
+const AUTO_TB_MAX_ENTRIES: u64 = 350_000_000;
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -49,7 +60,12 @@ struct CommonOpts {
     budget: u64,
     fallback_depth: u32,
     rules: Rules,
+    /// Explicit tablebase file (overrides auto).
     tb_path: Option<String>,
+    /// Disable the automatic tablebase.
+    no_tb: bool,
+    /// Override the auto-tablebase seed cap.
+    seeds_cap: Option<u32>,
 }
 
 impl Default for CommonOpts {
@@ -60,6 +76,8 @@ impl Default for CommonOpts {
             fallback_depth: DEFAULT_FALLBACK_DEPTH,
             rules: Rules::default(),
             tb_path: None,
+            no_tb: false,
+            seeds_cap: None,
         }
     }
 }
@@ -99,6 +117,18 @@ fn parse_common(flag: &str, iter: &mut std::slice::Iter<'_, String>, opts: &mut 
             opts.tb_path = Some(take_value(flag, iter)?.to_string());
             Ok(true)
         }
+        "--no-tb" => {
+            opts.no_tb = true;
+            Ok(true)
+        }
+        "--seeds-cap" => {
+            opts.seeds_cap = Some(
+                take_value(flag, iter)?
+                    .parse()
+                    .map_err(|_| "--seeds-cap must be a non-negative integer".to_string())?,
+            );
+            Ok(true)
+        }
         _ => Ok(false),
     }
 }
@@ -135,6 +165,7 @@ fn cmd_start(args: &[String]) -> Result<(), String> {
     let mut opts = CommonOpts::default();
     let mut pits: usize = 6;
     let mut seeds: u8 = 4;
+    let mut moves: Vec<usize> = Vec::new();
 
     let mut iter = args.iter();
     while let Some(arg) = iter.next() {
@@ -152,12 +183,56 @@ fn cmd_start(args: &[String]) -> Result<(), String> {
                     .parse()
                     .map_err(|_| "--seeds must be 0..=255".to_string())?
             }
+            // A sequence of 0-based pit indices to play from the opening, applied
+            // to whichever side is to move (extra-turn moves keep the same side).
+            "--moves" => {
+                for tok in take_value(arg, &mut iter)?.split([',', ' ']).filter(|t| !t.is_empty()) {
+                    moves.push(
+                        tok.parse()
+                            .map_err(|_| format!("--moves: '{tok}' is not a pit index"))?,
+                    );
+                }
+            }
             other => return Err(format!("unknown flag '{other}' for 'start'")),
         }
     }
 
-    let board = Board::start(pits, seeds, opts.turn)?;
+    let mut board = Board::start(pits, seeds, opts.turn)?;
+    if !moves.is_empty() {
+        board = play_moves(&board, &moves, &opts.rules)?;
+    }
     report(&board, &opts)
+}
+
+/// Apply a sequence of pit moves from `board`, printing each, and return the
+/// resulting position. Errors on an illegal move.
+fn play_moves(board: &Board, moves: &[usize], rules: &Rules) -> Result<Board, String> {
+    let mut cur = *board;
+    println!("Move sequence:");
+    for (k, &mv) in moves.iter().enumerate() {
+        if cur.is_terminal() {
+            return Err(format!("move {} (pit {mv}): game already over", k + 1));
+        }
+        if mv >= cur.pits_per_side() || cur.cells()[cur.pit_global(cur.turn(), mv)] == 0 {
+            return Err(format!(
+                "move {} (pit {mv}) is illegal for {} in position {}",
+                k + 1,
+                cur.turn(),
+                notation::format(&cur)
+            ));
+        }
+        let mover = cur.turn();
+        let r = cur.apply(rules, mv);
+        let tag = match (r.extra_turn, r.captured) {
+            (true, _) => " (extra turn)",
+            (_, true) => " (capture)",
+            _ => "",
+        };
+        println!("  {}. {mover} plays pit {mv}{tag}", k + 1);
+        cur = r.board;
+    }
+    println!();
+    Ok(cur)
 }
 
 fn report(board: &Board, opts: &CommonOpts) -> Result<(), String> {
@@ -166,28 +241,90 @@ fn report(board: &Board, opts: &CommonOpts) -> Result<(), String> {
     println!("Side to move: {}", board.turn());
     println!("Rules:        capture requires non-empty opposite pit = {}", opts.rules.capture_requires_nonempty_opposite);
 
-    // Load an optional endgame tablebase.
-    let tb = match &opts.tb_path {
-        Some(path) => {
-            let tb = Tablebase::load(Path::new(path))
-                .map_err(|e| format!("failed to load tablebase '{path}': {e}"))?;
-            if tb.pits_per_side() != board.pits_per_side() {
-                return Err(format!(
-                    "tablebase is for {}-pit boards, but this board has {} pits per side",
-                    tb.pits_per_side(),
-                    board.pits_per_side()
-                ));
-            }
-            println!("Tablebase:    {path} (cap {} seeds in play)", tb.cap());
-            Some(tb)
-        }
-        None => None,
-    };
+    // Resolve the endgame tablebase: explicit `--tb`, the automatic cached one,
+    // or none.
+    let tb = resolve_tablebase(board, opts)?;
     println!();
 
     let analysis = analyze_with_tb(board, opts.rules, opts.budget, opts.fallback_depth, tb.as_ref());
     println!("{}", render_analysis(board, &analysis));
     Ok(())
+}
+
+/// Decide which endgame tablebase to use: an explicit `--tb`, the automatic
+/// cached one (built on first use), or none.
+fn resolve_tablebase(board: &Board, opts: &CommonOpts) -> Result<Option<Tablebase>, String> {
+    let n = board.pits_per_side();
+
+    // Explicit tablebase file.
+    if let Some(path) = &opts.tb_path {
+        let tb = Tablebase::load(Path::new(path))
+            .map_err(|e| format!("failed to load tablebase '{path}': {e}"))?;
+        if tb.pits_per_side() != n {
+            return Err(format!(
+                "tablebase is for {}-pit boards, but this board has {n} pits per side",
+                tb.pits_per_side()
+            ));
+        }
+        println!("Tablebase:    {path} (cap {} seeds in play)", tb.cap());
+        return Ok(Some(tb));
+    }
+
+    // Automatic tablebase, unless disabled or the board is out of range.
+    if opts.no_tb || n > AUTO_TB_MAX_PITS || board.seeds_in_play() < AUTO_TB_MIN_SEEDS {
+        return Ok(None);
+    }
+    let cap = opts.seeds_cap.unwrap_or(AUTO_TB_CAP);
+    if Tablebase::entry_count(n, cap) > AUTO_TB_MAX_ENTRIES {
+        eprintln!(
+            "note: auto-tablebase for {n} pits / cap {cap} would be too large; skipping \
+             (use --seeds-cap to lower, or --no-tb to silence)"
+        );
+        return Ok(None);
+    }
+
+    let path = auto_tb_path(n, cap, &opts.rules);
+    if path.exists() {
+        if let Ok(tb) = Tablebase::load(&path) {
+            if tb.pits_per_side() == n && tb.cap() == cap {
+                println!("Tablebase:    {} (cached, cap {})", path.display(), tb.cap());
+                return Ok(Some(tb));
+            }
+        }
+        // Stale or unreadable cache — fall through and rebuild.
+    }
+
+    println!(
+        "Tablebase:    building {} (cap {cap}, {} entries; one-time) ...",
+        path.display(),
+        Tablebase::entry_count(n, cap)
+    );
+    let tb = Tablebase::build(opts.rules, n, cap);
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    match tb.save(&path) {
+        Ok(()) => println!("              cached to {}", path.display()),
+        Err(e) => eprintln!("note: built tablebase but could not cache it: {e}"),
+    }
+    Ok(Some(tb))
+}
+
+/// Directory for cached auto-tablebases (`$MANCALA_TB_DIR`, default `.mancala_tb`).
+fn auto_tb_dir() -> PathBuf {
+    std::env::var_os("MANCALA_TB_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(".mancala_tb"))
+}
+
+/// Cache filename for a tablebase, keyed by board size, cap, and capture rule.
+fn auto_tb_path(n: usize, cap: u32, rules: &Rules) -> PathBuf {
+    let capture = if rules.capture_requires_nonempty_opposite {
+        "capnonempty"
+    } else {
+        "capany"
+    };
+    auto_tb_dir().join(format!("kalah_p{n}_cap{cap}_{capture}.tb"))
 }
 
 fn cmd_gen_tb(args: &[String]) -> Result<(), String> {
@@ -430,7 +567,11 @@ ANALYZE:
         mancala-solver analyze --board "4,4,4,4,4,4,0 | 4,4,4,4,4,4,0"
 
 START:
-    mancala-solver start --pits 6 --seeds 4 [OPTIONS]
+    mancala-solver start --pits 6 --seeds 4 [--moves 2,5,1,0] [OPTIONS]
+
+    --moves applies a sequence of 0-based pit indices from the opening (to
+    whichever side is to move; extra-turn moves keep the same side), then
+    analyzes the resulting position.
 
 GEN-TB:
     mancala-solver gen-tb --pits 6 --seeds-cap 14 --out kalah6.tb [--capture-empty]
@@ -446,7 +587,16 @@ OPTIONS (analyze & start):
     --depth <D>         Heuristic fallback search depth in plies. Default: {depth}
     --capture-empty     Allow captures even when the opposite pit is empty
                         (default: captures require a non-empty opposite pit)
-    --tb <file>         Use a precomputed endgame tablebase (see gen-tb)
+    --tb <file>         Use a specific precomputed endgame tablebase (see gen-tb)
+    --no-tb             Disable the automatic endgame tablebase
+    --seeds-cap <N>     Seed cap for the automatic tablebase (default 14)
+
+ENDGAME TABLEBASE (automatic):
+    For boards up to 6 pits per side with enough seeds in play, an endgame
+    tablebase is built and cached automatically on first use (under
+    $MANCALA_TB_DIR, default ./.mancala_tb), then reused on later runs. It makes
+    endgame positions O(1) lookups. Use --no-tb to disable, or gen-tb to build
+    one explicitly.
 
 OUTPUT:
     A board diagram, the exact result (or heuristic estimate), the best move,

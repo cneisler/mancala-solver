@@ -17,5 +17,9 @@ pub mod notation;
 pub mod solver;
 pub mod tablebase;
 
+/// Browser/WebAssembly C-ABI shim (only built for `wasm32`).
+#[cfg(target_arch = "wasm32")]
+pub mod wasm_api;
+
 pub use board::{Board, MoveResult, Player, Rules};
 pub use solver::{analyze, Analysis, MoveEval};
