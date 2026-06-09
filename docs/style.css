@@ -71,3 +71,23 @@ button.secondary { background: var(--pit); color: var(--text); }
 footer { color: var(--muted); font-size: 0.85rem; padding: 24px 16px 40px; }
 footer a { color: var(--accent); }
 .err { color: #e06c75; }
+
+/* Mobile: shrink the board so a 6-pit row + stores fit a narrow screen. */
+@media (max-width: 560px) {
+  header { padding-top: 14px; }
+  h1 { font-size: 1.3rem; }
+  .board { padding: 10px; gap: 8px; border-radius: 12px; }
+  .store { min-width: 40px; min-height: 120px; }
+  .store .count { font-size: 1.3rem; }
+  .store .who { font-size: 0.65rem; }
+  .rows { gap: 8px; }
+  .row { gap: 6px; }
+  .pit { min-height: 52px; border-radius: 9px; }
+  .pit .count { font-size: 1.05rem; }
+  .pit .lot { font-size: 0.55rem; top: 2px; left: 3px; }
+  .controls, .actions { gap: 8px; }
+  button { padding: 9px 13px; }   /* keep tap targets comfortable */
+  .evals { grid-template-columns: auto auto; }  /* drop the tags column when tight */
+  .evals span:nth-child(3n) { display: none; }
+}
+
