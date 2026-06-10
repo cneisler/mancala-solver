@@ -11,6 +11,7 @@ use std::alloc::{alloc, dealloc, Layout};
 use std::cell::RefCell;
 
 use crate::board::{Board, Player, Rules};
+use crate::book::Book;
 use crate::notation;
 use crate::solver;
 use crate::tablebase::Tablebase;
@@ -18,6 +19,8 @@ use crate::tablebase::Tablebase;
 thread_local! {
     /// Optional endgame tablebase supplied by the host (see [`wasm_set_tb`]).
     static TB: RefCell<Option<Tablebase>> = const { RefCell::new(None) };
+    /// Optional opening book supplied by the host (see [`wasm_set_book`]).
+    static BOOK: RefCell<Option<Book>> = const { RefCell::new(None) };
 }
 
 /// Allocate `len` bytes for JS to write into. `len == 0` allocates 1 byte.
@@ -135,8 +138,23 @@ pub extern "C" fn wasm_set_tb(ptr: *const u8, len: usize) -> u32 {
     }
 }
 
-/// `analyze(board, turn, budget, fallback_depth, capture_empty)` → JSON analysis,
-/// consulting the installed tablebase (if any) for the endgame.
+/// Install an opening book (raw file bytes). Returns 1 on success, 0 otherwise.
+/// A book only applies to positions of its own board size.
+#[no_mangle]
+pub extern "C" fn wasm_set_book(ptr: *const u8, len: usize) -> u32 {
+    let bytes = unsafe { std::slice::from_raw_parts(ptr, len) };
+    match Book::from_bytes(bytes) {
+        Ok(book) => {
+            BOOK.with(|c| *c.borrow_mut() = Some(book));
+            1
+        }
+        Err(_) => 0,
+    }
+}
+
+/// `analyze(board, turn, budget, fallback_depth, capture_empty)` → JSON analysis.
+/// Consults the opening book first (an instant exact lookup for early positions),
+/// then the installed tablebase for the endgame.
 #[no_mangle]
 pub extern "C" fn wasm_analyze(
     ptr: *const u8,
@@ -151,15 +169,16 @@ pub extern "C" fn wasm_analyze(
         Ok(b) => b,
         Err(e) => return ret(json_error(&e)),
     };
-    let json = TB.with(|c| {
-        let tb = c.borrow();
-        let a = solver::analyze_with_tb(
-            &board,
-            rules(capture_empty),
-            budget as u64,
-            fallback_depth,
-            tb.as_ref(),
-        );
+    let rules = rules(capture_empty);
+    let json = TB.with(|tc| {
+        let tb = tc.borrow();
+        let booked = BOOK.with(|bc| {
+            bc.borrow()
+                .as_ref()
+                .and_then(|book| book.analyze(&board, rules, tb.as_ref()))
+        });
+        let a =
+            booked.unwrap_or_else(|| solver::analyze_with_tb(&board, rules, budget as u64, fallback_depth, tb.as_ref()));
         analysis_json(&a)
     });
     ret(json)

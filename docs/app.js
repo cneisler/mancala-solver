@@ -60,7 +60,7 @@ function spawnWorker(onReady) {
     const m = e.data;
     if (m.type === "ready") {
       workerReady = true;
-      if (onReady) onReady(m.tb);
+      if (onReady) onReady(m);
     } else if (m.type === "result" && pending) {
       const p = pending;
       pending = null;
@@ -357,10 +357,11 @@ function undo() {
     await loadWasm();
     const status = document.getElementById("status");
     status.textContent = "loading tablebase…";
-    spawnWorker((tb) => {
-      status.textContent = tb
-        ? "engine ready · 6-pit endgame tablebase loaded (≤12 seeds solved instantly)"
-        : "engine ready";
+    spawnWorker((m) => {
+      const bits = [];
+      if (m.tb) bits.push("6-pit endgame tablebase (≤12 seeds instant)");
+      if (m.book) bits.push("6×4 opening book (early game exact & instant)");
+      status.textContent = bits.length ? `engine ready · ${bits.join(" · ")}` : "engine ready";
       updateControls(); // enable Analyze now that the worker can answer
     });
     document.getElementById("newGame").onclick = newGame;

@@ -10,6 +10,7 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use mancala::board::{Board, Player, Rules};
+use mancala::book::Book;
 use mancala::notation;
 use mancala::solver::{analyze_with_tb, Analysis, MoveEval, Outcome};
 use mancala::tablebase::Tablebase;
@@ -50,6 +51,7 @@ fn run(args: &[String]) -> Result<(), String> {
         Some("analyze") => cmd_analyze(&args[1..]),
         Some("start") => cmd_start(&args[1..]),
         Some("gen-tb") => cmd_gen_tb(&args[1..]),
+        Some("gen-book") => cmd_gen_book(&args[1..]),
         Some("playtest") => cmd_playtest(&args[1..]),
         Some(other) => Err(format!("unknown command '{other}'")),
     }
@@ -67,6 +69,8 @@ struct CommonOpts {
     no_tb: bool,
     /// Override the auto-tablebase seed cap.
     seeds_cap: Option<u32>,
+    /// Optional opening book file (exact early-game lookups).
+    book_path: Option<String>,
 }
 
 impl Default for CommonOpts {
@@ -79,6 +83,7 @@ impl Default for CommonOpts {
             tb_path: None,
             no_tb: false,
             seeds_cap: None,
+            book_path: None,
         }
     }
 }
@@ -116,6 +121,10 @@ fn parse_common(flag: &str, iter: &mut std::slice::Iter<'_, String>, opts: &mut 
         }
         "--tb" => {
             opts.tb_path = Some(take_value(flag, iter)?.to_string());
+            Ok(true)
+        }
+        "--book" => {
+            opts.book_path = Some(take_value(flag, iter)?.to_string());
             Ok(true)
         }
         "--no-tb" => {
@@ -245,9 +254,35 @@ fn report(board: &Board, opts: &CommonOpts) -> Result<(), String> {
     // Resolve the endgame tablebase: explicit `--tb`, the automatic cached one,
     // or none.
     let tb = resolve_tablebase(board, opts)?;
-    println!();
 
-    let analysis = analyze_with_tb(board, opts.rules, opts.budget, opts.fallback_depth, tb.as_ref());
+    // Consult an opening book first: if the position is in it, the exact result
+    // is an instant lookup (no search).
+    let analysis = if let Some(path) = &opts.book_path {
+        let book = Book::load(Path::new(path))
+            .map_err(|e| format!("failed to load book '{path}': {e}"))?;
+        if book.pits_per_side() != board.pits_per_side() {
+            return Err(format!(
+                "book is for {}-pit boards, but this board has {} pits per side",
+                book.pits_per_side(),
+                board.pits_per_side()
+            ));
+        }
+        match book.analyze(board, opts.rules, tb.as_ref()) {
+            Some(a) => {
+                println!("Opening book: {path} (position found — exact lookup)");
+                println!();
+                a
+            }
+            None => {
+                println!("Opening book: {path} (position not in book — searching)");
+                println!();
+                analyze_with_tb(board, opts.rules, opts.budget, opts.fallback_depth, tb.as_ref())
+            }
+        }
+    } else {
+        println!();
+        analyze_with_tb(board, opts.rules, opts.budget, opts.fallback_depth, tb.as_ref())
+    };
     println!("{}", render_analysis(board, &analysis));
     Ok(())
 }
@@ -379,6 +414,65 @@ fn cmd_gen_tb(args: &[String]) -> Result<(), String> {
     tb.save(Path::new(&out))
         .map_err(|e| format!("failed to write '{out}': {e}"))?;
     println!("Wrote {out}");
+    Ok(())
+}
+
+fn cmd_gen_book(args: &[String]) -> Result<(), String> {
+    let mut pits: usize = 6;
+    let mut seeds: u8 = 4;
+    let mut plies: u32 = 2;
+    let mut tb_path: Option<String> = None;
+    let mut out: Option<String> = None;
+    let mut rules = Rules::default();
+
+    let mut iter = args.iter();
+    while let Some(arg) = iter.next() {
+        match arg.as_str() {
+            "--pits" => {
+                pits = take_value(arg, &mut iter)?
+                    .parse()
+                    .map_err(|_| "--pits must be a positive integer".to_string())?
+            }
+            "--seeds" => {
+                seeds = take_value(arg, &mut iter)?
+                    .parse()
+                    .map_err(|_| "--seeds must be 0..=255".to_string())?
+            }
+            "--plies" => {
+                plies = take_value(arg, &mut iter)?
+                    .parse()
+                    .map_err(|_| "--plies must be a non-negative integer".to_string())?
+            }
+            "--tb" => tb_path = Some(take_value(arg, &mut iter)?.to_string()),
+            "--out" | "-o" => out = Some(take_value(arg, &mut iter)?.to_string()),
+            "--capture-empty" => rules.capture_requires_nonempty_opposite = false,
+            other => return Err(format!("unknown flag '{other}' for 'gen-book'")),
+        }
+    }
+
+    let out = out.ok_or("gen-book requires --out <file>")?;
+    let tb_path = tb_path.ok_or("gen-book requires --tb <file> (an endgame tablebase)")?;
+    let tb = Tablebase::load(Path::new(&tb_path))
+        .map_err(|e| format!("failed to load tablebase '{tb_path}': {e}"))?;
+    if tb.pits_per_side() != pits {
+        return Err(format!(
+            "tablebase is for {}-pit boards, but --pits {pits}",
+            tb.pits_per_side()
+        ));
+    }
+
+    println!("Building opening book: pits={pits} seeds={seeds} plies={plies} (tablebase cap {})...", tb.cap());
+    let mut last = usize::MAX;
+    let book = Book::build(rules, pits, seeds, plies, &tb, |done, total| {
+        if done != last {
+            last = done;
+            eprint!("\r  solving layouts… {done}/{total}");
+        }
+    })?;
+    eprintln!("\r  solved {} layouts.            ", book.len());
+    book.save(Path::new(&out))
+        .map_err(|e| format!("failed to write '{out}': {e}"))?;
+    println!("Wrote {out} ({} positions)", book.len());
     Ok(())
 }
 

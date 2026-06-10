@@ -856,6 +856,33 @@ pub fn analyze_with_tb(
     limited.analyze_root(board, Some(fallback_depth))
 }
 
+/// A reusable exact solver that keeps one transposition table warm across many
+/// root positions. Solving several nearby positions (e.g. an opening tree) in
+/// turn is far cheaper than independent solves because each later search reuses
+/// the table the earlier ones populated. Used to build opening books.
+pub struct Solver<'a> {
+    searcher: Searcher<'a>,
+}
+
+impl<'a> Solver<'a> {
+    /// A solver that consults `tb` for the endgame (required — high-seed root
+    /// solves are only tractable with a tablebase).
+    pub fn new(rules: Rules, tb: &'a Tablebase) -> Solver<'a> {
+        Solver {
+            searcher: Searcher::new(rules, u64::MAX, 0, Some(tb), TT_MAX_SLOTS_EXACT),
+        }
+    }
+
+    /// Exactly solve `board`, returning its game value (seed margin) and best
+    /// move. Reuses the warm transposition table from previous calls.
+    pub fn solve(&mut self, board: &Board) -> (i32, Option<usize>) {
+        self.searcher.nodes = 0;
+        self.searcher.aborted = false;
+        let a = self.searcher.analyze_root(board, None);
+        (a.value, a.best_move)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -16,12 +16,13 @@ async function loadWasm() {
   }
 }
 
-async function loadTb() {
+// Install a binary resource (tablebase or opening book) via `setter`.
+async function install(url, setter) {
   try {
-    const bytes = new Uint8Array(await (await fetch("kalah6.bin")).arrayBuffer());
+    const bytes = new Uint8Array(await (await fetch(url)).arrayBuffer());
     const ptr = wasm.wasm_alloc(bytes.length);
     new Uint8Array(wasm.memory.buffer, ptr, bytes.length).set(bytes);
-    const ok = wasm.wasm_set_tb(ptr, bytes.length);
+    const ok = setter(ptr, bytes.length);
     wasm.wasm_dealloc(ptr, bytes.length);
     return ok === 1;
   } catch {
@@ -58,6 +59,7 @@ onmessage = (e) => {
 
 (async function () {
   await loadWasm();
-  const tb = await loadTb();
-  postMessage({ type: "ready", tb });
+  const tb = await install("kalah6.bin", wasm.wasm_set_tb);
+  const book = await install("kalah6_book.bin", wasm.wasm_set_book);
+  postMessage({ type: "ready", tb, book });
 })();

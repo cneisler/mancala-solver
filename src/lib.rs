@@ -11,6 +11,7 @@
 //!   accepted on the command line.
 
 pub mod board;
+pub mod book;
 pub mod endgame;
 pub mod hash;
 pub mod notation;
