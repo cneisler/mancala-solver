@@ -50,6 +50,7 @@ fn run(args: &[String]) -> Result<(), String> {
         Some("analyze") => cmd_analyze(&args[1..]),
         Some("start") => cmd_start(&args[1..]),
         Some("gen-tb") => cmd_gen_tb(&args[1..]),
+        Some("playtest") => cmd_playtest(&args[1..]),
         Some(other) => Err(format!("unknown command '{other}'")),
     }
 }
@@ -381,6 +382,123 @@ fn cmd_gen_tb(args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
+fn cmd_playtest(args: &[String]) -> Result<(), String> {
+    use mancala::playtest::{run_match, Engine, MatchConfig};
+
+    let mut a_spec = "h:8".to_string();
+    let mut b_spec = "h:6".to_string();
+    let mut pits: usize = 6;
+    let mut seeds: u8 = 4;
+    let mut games: usize = 1000;
+    let mut opening_plies: u32 = 4;
+    let mut seed: u64 = 1;
+    let mut rules = Rules::default();
+    let mut tb_path: Option<String> = None;
+    let mut threads: usize = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1);
+
+    let mut iter = args.iter();
+    while let Some(arg) = iter.next() {
+        match arg.as_str() {
+            "--a" => a_spec = take_value(arg, &mut iter)?.to_string(),
+            "--b" => b_spec = take_value(arg, &mut iter)?.to_string(),
+            "--pits" => {
+                pits = take_value(arg, &mut iter)?
+                    .parse()
+                    .map_err(|_| "--pits must be a positive integer".to_string())?
+            }
+            "--seeds" => {
+                seeds = take_value(arg, &mut iter)?
+                    .parse()
+                    .map_err(|_| "--seeds must be 0..=255".to_string())?
+            }
+            "--games" => {
+                games = take_value(arg, &mut iter)?
+                    .parse()
+                    .map_err(|_| "--games must be a positive integer".to_string())?
+            }
+            "--opening-plies" => {
+                opening_plies = take_value(arg, &mut iter)?
+                    .parse()
+                    .map_err(|_| "--opening-plies must be a non-negative integer".to_string())?
+            }
+            "--seed" => {
+                seed = take_value(arg, &mut iter)?
+                    .parse()
+                    .map_err(|_| "--seed must be a non-negative integer".to_string())?
+            }
+            "--threads" => {
+                threads = take_value(arg, &mut iter)?
+                    .parse()
+                    .map_err(|_| "--threads must be a positive integer".to_string())?
+            }
+            "--tb" => tb_path = Some(take_value(arg, &mut iter)?.to_string()),
+            "--capture-empty" => rules.capture_requires_nonempty_opposite = false,
+            other => return Err(format!("unknown flag '{other}' for 'playtest'")),
+        }
+    }
+
+    let a = Engine::parse(&a_spec)?;
+    let b = Engine::parse(&b_spec)?;
+    // Each opening is played from both sides, so two games per opening.
+    let openings = games.div_ceil(2).max(1);
+
+    let tb = match &tb_path {
+        Some(p) => {
+            let t = Tablebase::load(Path::new(p)).map_err(|e| format!("failed to load tablebase '{p}': {e}"))?;
+            if t.pits_per_side() != pits {
+                return Err(format!(
+                    "tablebase is for {}-pit boards, but --pits {pits}",
+                    t.pits_per_side()
+                ));
+            }
+            Some(t)
+        }
+        None => None,
+    };
+
+    let cfg = MatchConfig {
+        pits,
+        seeds,
+        rules,
+        openings,
+        opening_plies,
+        seed,
+        threads,
+    };
+
+    println!("Playtest  A = {a_spec}   B = {b_spec}");
+    println!(
+        "Board {pits}×{seeds}, {} games ({openings} openings × 2 sides), {opening_plies} random opening plies, seed {seed}, {threads} thread(s)",
+        openings * 2
+    );
+    println!();
+
+    let total = openings * 2;
+    let mut last_pct = usize::MAX;
+    let res = run_match(a, b, &cfg, tb.as_ref(), |done, tot| {
+        let pct = done * 100 / tot.max(1);
+        if pct != last_pct && pct % 5 == 0 {
+            last_pct = pct;
+            eprint!("\r  playing… {pct:3}% ({done}/{tot})");
+        }
+    })?;
+    eprintln!("\r  done.                                ");
+
+    let n = res.games();
+    let (lo, hi) = res.elo_ci();
+    let elo = res.elo();
+    println!("Result (from A's perspective):");
+    println!(
+        "  W {}  L {}  D {}   ({} games)",
+        res.wins, res.losses, res.draws, n
+    );
+    println!("  Score: {:.1}%", res.score() * 100.0);
+    println!("  Elo (A − B): {:+.1}  [95% CI {:+.0} … {:+.0}]", elo, lo, hi);
+    println!("  LOS (A stronger than B): {:.1}%", res.los() * 100.0);
+    let _ = total;
+    Ok(())
+}
+
 /// Render the board as a classic two-row Kalah diagram.
 ///
 /// P1 (North) pits run right-to-left across the top; P0 (South) pits run
@@ -554,6 +672,7 @@ COMMANDS:
     analyze   Analyze a position given in board notation
     start     Analyze the standard opening for a given board size
     gen-tb    Build an offline endgame tablebase and write it to disk
+    playtest  Play two engine configs against each other and report Elo
     help      Show this help
 
 ANALYZE:
@@ -579,6 +698,17 @@ GEN-TB:
     Precomputes exact endgame values for every pit layout with up to
     <seeds-cap> seeds in play, writing a tablebase file. Pass it to analyze/start
     with --tb to make those endgame positions O(1) lookups.
+
+PLAYTEST:
+    mancala-solver playtest --a h:8 --b h:6 [--games 1000] [OPTIONS]
+
+    Plays engine A against engine B over a diverse opening book (each opening
+    from both sides) and reports the score, the Elo difference with a 95%
+    confidence interval, and the likelihood A is stronger. Engine specs:
+        h:<depth>             depth-limited heuristic search
+        a:<budget>:<depth>    exact within <budget> nodes, else heuristic
+    Options: --pits N --seeds S --games N --opening-plies K --seed X
+             --threads N --tb <file> --capture-empty
 
 OPTIONS (analyze & start):
     --turn <0|1>        Side to move (0 = P0/South, 1 = P1/North). Default: 0

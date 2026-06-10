@@ -17,6 +17,10 @@ pub mod notation;
 pub mod solver;
 pub mod tablebase;
 
+/// Self-play strength testing (native only; not needed in the browser build).
+#[cfg(not(target_arch = "wasm32"))]
+pub mod playtest;
+
 /// Browser/WebAssembly C-ABI shim (only built for `wasm32`).
 #[cfg(target_arch = "wasm32")]
 pub mod wasm_api;

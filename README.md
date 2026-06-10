@@ -217,6 +217,24 @@ mancala-solver start --pits 6 --seeds 4 --tb kalah6.tb --budget 100000000000
 Higher caps cover more of the search tree (faster solves of hard boards like
 Kalah(6,4)) at the cost of a larger one-time build and file.
 
+## Measuring playing strength
+
+For positions too large to solve exactly, strength only shows up over many
+games. The `playtest` command pits two engine configurations against each other
+over a diverse opening book (each opening played from both sides so colour bias
+cancels) and reports the score, the **Elo difference with a 95% confidence
+interval**, and the likelihood one side is stronger — the way engine changes are
+normally graded:
+
+```sh
+# Does searching deeper actually play better? (it does)
+mancala-solver playtest --a h:8 --b h:6 --games 1000 --threads 8
+```
+
+Engine specs are `h:<depth>` (depth-limited heuristic) or `a:<budget>:<depth>`
+(exact within a node budget, else heuristic). A symmetric matchup (`--a h:6 --b
+h:6`) scores exactly 50% / 0 Elo, confirming the harness is unbiased.
+
 ## Project layout
 
 The engine is a UI-independent library (`mancala`) so a future GUI/web front-end
@@ -230,7 +248,9 @@ can reuse it:
 - `src/tablebase.rs` — offline endgame tablebase: parallel build, save, load, lookup.
 - `src/hash.rs` — fast `u128`-key hasher shared by the TT and endgame tables.
 - `src/notation.rs` — board-notation parsing/formatting.
-- `src/main.rs` — the `mancala-solver` CLI (`analyze`, `start`, `gen-tb`).
+- `src/playtest.rs` — self-play strength testing: opening book, match runner,
+  Elo / confidence-interval / likelihood-of-superiority statistics.
+- `src/main.rs` — the `mancala-solver` CLI (`analyze`, `start`, `gen-tb`, `playtest`).
 
 ## Tests
 
