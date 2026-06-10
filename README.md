@@ -63,13 +63,13 @@ changes.
 
 In the browser the solver uses the in-memory search with a node **budget**
 (selectable). A small **6-pit endgame tablebase** (`docs/kalah6.bin`, ~5 MB,
-≤ 11 seeds in play) ships with the page and is loaded on startup, so 6-pit
+≤ 12 seeds in play) ships with the page and is loaded on startup, so 6-pit
 endgames are solved **exactly and instantly** and mid-game positions resolve
 exactly far more often. Positions still too big for the budget (e.g. Kalah(6,4)
 straight from the opening) fall back to a clearly-labelled heuristic estimate —
-the multi-hundred-MB high-cap tablebases that would solve those aren't shipped to
-the browser. Rebuild the bundled table with
-`mancala-solver gen-tb --pits 6 --seeds-cap 11 --out docs/kalah6.bin`.
+the high-cap tablebases that would solve those aren't shipped to the browser.
+Rebuild the bundled table with
+`mancala-solver gen-tb --pits 6 --seeds-cap 12 --out docs/kalah6.bin`.
 
 ## Usage
 
@@ -153,13 +153,13 @@ on a 4-core machine:
 | Kalah(4,4) | win by 2 | ~1 s |
 | Kalah(5,3) | win by 6 | ~1 s |
 | Kalah(5,4) | win by 10 | ~7 s |
-| Kalah(6,3) | win by 2 | ~5 s |
-| **Kalah(6,4)** | **win by 8** (best opening: pit 2) | **~6 min** (with a cap-16 tablebase) |
+| Kalah(6,3) | win by 2 | ~4 s |
+| **Kalah(6,4)** | **win by 8** (best opening: pit 2) | **~6 min** (cap-17 tablebase: ~100 s build, ~99 MB) |
 
 The classic **Kalah(6,4)** is solvable: it's a first-player win by 8 seeds, with
 the optimal opening being pit 2 (the move that scores into the store for a free
 turn). It needs a larger tablebase than the default cap (e.g.
-`--seeds-cap 16`) and a raised `--budget`.
+`--seeds-cap 17`) and a raised `--budget`.
 
 For positions still too large to finish within the node budget, the solver
 automatically falls back to a depth-limited **heuristic** search, clearly
@@ -182,8 +182,10 @@ plus a `g` lookup.
 
 `g` is precomputed for **every** layout up to a seed cap into a tablebase file
 (a flat array indexed by a combinatorial rank of the layout, so no keys are
-stored on disk). The same table serves every *fill* of a board size — Kalah(6,2),
-(6,3), (6,4), … all share the 6-pit table.
+stored on disk). Entries are **mirror-canonical** — Kalah is player-symmetric,
+so a layout is indexed as (mover's pits, opponent's pits) and one entry serves
+both players, halving the table. The same table also serves every *fill* of a
+board size — Kalah(6,2), (6,3), (6,4), … all share the 6-pit table.
 
 **Automatic (default).** For boards up to 6 pits per side with enough seeds in
 play, the solver builds a tablebase on first use, caches it under
@@ -195,7 +197,7 @@ manual step needed. Disable with `--no-tb`, or change the cap with
 
 ```sh
 # Build (uses all cores): all layouts with <= 16 seeds in play on a 6-pit board.
-mancala-solver gen-tb --pits 6 --seeds-cap 16 --out kalah6.tb
+mancala-solver gen-tb --pits 6 --seeds-cap 17 --out kalah6.tb
 
 # Use it on any 6-pit position; endgame positions become O(1) array lookups.
 mancala-solver start --pits 6 --seeds 4 --tb kalah6.tb --budget 100000000000

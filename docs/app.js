@@ -260,7 +260,7 @@ function undo() {
     await loadWasm();
     const tbOk = await loadTb();
     document.getElementById("status").textContent = tbOk
-      ? "engine ready · 6-pit endgame tablebase loaded (≤11 seeds solved instantly)"
+      ? "engine ready · 6-pit endgame tablebase loaded (≤12 seeds solved instantly)"
       : "engine ready";
     document.getElementById("newGame").onclick = newGame;
     document.getElementById("undo").onclick = undo;

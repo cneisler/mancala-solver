@@ -163,15 +163,22 @@ impl<'a> Searcher<'a> {
         }
     }
 
-    /// Transposition-table key: side to move + a depth marker (255 for exact
-    /// searches so they never collide with depth-limited entries) + the seed
-    /// counts.
+    /// Transposition-table key: the seed counts packed **mover-first**, plus a
+    /// depth marker (255 for exact searches so they never collide with
+    /// depth-limited entries).
+    ///
+    /// Packing the side to move's cells first (instead of P0-then-P1 plus a turn
+    /// bit) canonicalizes **mirror positions**: Kalah is player-symmetric, so a
+    /// position where the mover holds pits `A` against `B` has the same value no
+    /// matter which player the mover is. Both mirrors collapse to one entry —
+    /// stored values are already mover-perspective (negamax) and best moves are
+    /// mover-local pit indices, so entries transfer between mirrors verbatim.
     ///
     /// In exact mode the key packs **only the pits**, not the stores: the stored
-    /// value is the store-independent future differential `g`, so all positions
-    /// sharing a pit layout and side to move collapse to one entry (see the
+    /// value is the store-independent future differential `g` (see the
     /// `±store_diff` transform in [`Self::search`]). In depth-limited mode the
-    /// heuristic depends on the stores, so the full cell layout is keyed.
+    /// heuristic depends on the stores, so each side's store is included after
+    /// its pits.
     ///
     /// Returns `None` when the packed key would not fit in a `u128` (only very
     /// large boards or extremely full pits).
@@ -180,8 +187,8 @@ impl<'a> Searcher<'a> {
         let cells = b.cells();
         let store_independent = depth.is_none();
         let included = if store_independent { 2 * n } else { 2 * n + 2 };
-        // Bits: cells (CELL_BITS each) + 1 turn bit + 8 depth-marker bits.
-        if included as u32 * CELL_BITS + 1 + 8 > 128 {
+        // Bits: cells (CELL_BITS each) + 8 depth-marker bits.
+        if included as u32 * CELL_BITS + 8 > 128 {
             return None;
         }
         let mut packed: u128 = 0;
@@ -192,30 +199,21 @@ impl<'a> Searcher<'a> {
             packed = (packed << CELL_BITS) | c as u128;
             true
         };
-        if store_independent {
+        let mover = b.turn();
+        for p in [mover, mover.other()] {
             for i in 0..n {
-                if !push(cells[b.pit_global(Player::P0, i)]) {
+                if !push(cells[b.pit_global(p, i)]) {
                     return None;
                 }
             }
-            for i in 0..n {
-                if !push(cells[b.pit_global(Player::P1, i)]) {
-                    return None;
-                }
-            }
-        } else {
-            for &c in cells {
-                if !push(c) {
-                    return None;
-                }
+            if !store_independent && !push(b.store(p)) {
+                return None;
             }
         }
-        let turn_bit: u128 = if b.turn() == Player::P1 { 1 } else { 0 };
         let depth_marker: u128 = match depth {
             None => 255,
             Some(d) => d.min(254) as u128,
         };
-        packed = (packed << 1) | turn_bit;
         packed = (packed << 8) | depth_marker;
         Some(packed)
     }
