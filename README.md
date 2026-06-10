@@ -154,17 +154,23 @@ on a 4-core machine:
 | Kalah(5,3) | win by 6 | ~1 s |
 | Kalah(5,4) | win by 10 | ~7 s |
 | Kalah(6,3) | win by 2 | ~4 s |
-| **Kalah(6,4)** | **win by 8** (best opening: pit 2) | **~6 min** (cap-17 tablebase: ~100 s build, ~99 MB) |
+| **Kalah(6,4)** | **win by 8** (best opening: pit 2) | **~3 min** (cap-17 tablebase: ~100 s build, ~99 MB) |
 
 The classic **Kalah(6,4)** is solvable: it's a first-player win by 8 seeds, with
 the optimal opening being pit 2 (the move that scores into the store for a free
 turn). It needs a larger tablebase than the default cap (e.g.
 `--seeds-cap 17`) and a raised `--budget`.
 
+The transposition table is a custom dense open-addressing table (one `u128`
+per slot, packing the position key and value) that grows with the search and
+is `madvise`d for transparent huge pages. It caches far more positions per
+gigabyte than a general-purpose hash map, which is what makes a full Kalah(6,4)
+solve fit in memory while dropping fewer positions.
+
 For positions still too large to finish within the node budget, the solver
 automatically falls back to a depth-limited **heuristic** search, clearly
 labelled in the output. Memory stays bounded throughout (the transposition
-table is capped — it will not exhaust RAM).
+table grows only up to a fixed cap — it will not exhaust RAM).
 
 The move-evaluation table reports an **exact** value for the best move; clearly
 inferior moves are shown as a bound (e.g. `≤ +2 seeds`) because the solver

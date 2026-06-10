@@ -14,7 +14,6 @@
 
 use crate::board::{Board, Player, Rules, MAX_PITS};
 use crate::endgame::Endgame;
-use crate::hash::U128Map;
 use crate::tablebase::Tablebase;
 
 /// Weight applied to a stored seed in the heuristic evaluation (and to the
@@ -104,25 +103,227 @@ enum Flag {
     Upper,
 }
 
-struct TtEntry {
+/// A decoded transposition-table hit.
+#[derive(Clone, Copy)]
+struct TtProbe {
     value: i32,
     flag: Flag,
-    /// Best move's pit index, or 255 if none was recorded.
-    best: u8,
+    best: Option<usize>,
 }
 
 /// Number of bits used to encode a single cell in the packed key. Cells holding
 /// 64 or more seeds (or boards too wide to fit) skip the transposition table.
 const CELL_BITS: u32 = 6;
 
-/// Maximum number of transposition-table entries. Caps memory so an unbounded
-/// exact search can never exhaust RAM: once the table is full we simply stop
-/// caching new positions (they are recomputed if revisited), keeping the search
-/// correct, only slower. At ~48 bytes per stored entry this is ≈8.5 GB, sized
-/// to let a full Kalah(6,4) solve fit in memory on a 16 GB host.
-const TT_MAX_ENTRIES: usize = 180_000_000;
+/// Bits of payload packed into the low end of each `u128` slot alongside the
+/// board key (high bits): value (`i16`, 16 bits) + flag (2 bits) + best-move
+/// (4 bits). Keys needing more than `128 - PAYLOAD_BITS` bits are uncacheable.
+const PAYLOAD_BITS: u32 = 22;
+const PAYLOAD_MASK: u128 = (1 << PAYLOAD_BITS) - 1;
 
-type TtMap = U128Map<TtEntry>;
+/// Maximum slots for the exact table (each is 16 B). 2^28 slots is 4.3 GB and
+/// holds well over the std map's 180M-entry cap — in half the memory — so far
+/// fewer positions are dropped and re-searched. (Peak during the final doubling
+/// is ≈6.4 GB, within budget.)
+const TT_MAX_SLOTS_EXACT: usize = 1 << 28;
+
+/// Grow (while below the cap) when entries reach this fraction (×/20) of slots,
+/// keeping probe chains short and the table proportional to the working set so
+/// light searches stay compact and cache-resident.
+const TT_GROW_NUM: usize = 12; // 12/20 = 0.60
+
+/// Linear-probe bound. Below the grow threshold chains are a few slots; this is
+/// a safety valve once the capped table fills (a position past it goes uncached
+/// — correct, just not cached — instead of scanning the whole array).
+const TT_MAX_PROBE: usize = 48;
+
+/// Mix a packed key to a `u64` for slot selection (same constants as the shared
+/// `U128Hasher`).
+#[inline]
+fn tt_mix(key: u128) -> u64 {
+    let mut h = (key as u64) ^ ((key >> 64) as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    h ^= h >> 32;
+    h = h.wrapping_mul(0xFF51_AFD7_ED55_8CCD);
+    h ^= h >> 29;
+    h
+}
+
+/// Advise the kernel to back `buf` with transparent huge pages. The multi-GB TT
+/// is accessed randomly; 2 MB pages cut TLB misses by ~512× versus 4 KB pages,
+/// which the std allocator cannot arrange on a `madvise`-only THP system. Raw
+/// syscall to avoid any external dependency; best-effort (ignored on failure or
+/// non-Linux/x86-64).
+#[inline]
+fn advise_hugepages(buf: &[u128]) {
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    unsafe {
+        const SYS_MADVISE: usize = 28;
+        const MADV_HUGEPAGE: usize = 14;
+        const HP: usize = 2 * 1024 * 1024; // 2 MB huge page
+        // `madvise(MADV_HUGEPAGE)` needs a page-aligned range, and huge pages only
+        // back 2 MB-aligned spans. The allocator's pointer carries a small header
+        // offset, so align the start up and the length down to 2 MB.
+        let start = buf.as_ptr() as usize;
+        let end = start + std::mem::size_of_val(buf);
+        let aligned = (start + HP - 1) & !(HP - 1);
+        if end <= aligned {
+            return;
+        }
+        let alen = (end - aligned) & !(HP - 1);
+        if alen == 0 {
+            return;
+        }
+        let _ret: isize;
+        std::arch::asm!(
+            "syscall",
+            inlateout("rax") SYS_MADVISE => _ret,
+            in("rdi") aligned,
+            in("rsi") alen,
+            in("rdx") MADV_HUGEPAGE,
+            lateout("rcx") _,
+            lateout("r11") _,
+            options(nostack, preserves_flags),
+        );
+    }
+    #[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
+    let _ = buf;
+}
+
+/// A dense, open-addressing (linear-probing) transposition table.
+///
+/// A flat `Vec<u128>`; each slot fuses the board key (high bits) with a 22-bit
+/// payload (value/flag/best). At 16 B/slot it is ~2× denser than the std map's
+/// 16-aligned `(u128, TtEntry)` slots, so more of the working set fits in the
+/// 260 MB L3 and far more positions are cached before the table fills (in half
+/// the memory). A lookup reads only the entry array (no separate control bytes)
+/// and — because four slots share a 64-byte line — the short probe chains at the
+/// table's working load usually stay on one line; a child's line is prefetched
+/// before recursing into it. The table doubles (rehash) up to `max_slots`,
+/// staying proportional to the working set so small searches keep good locality.
+/// It never overwrites a different key, so a cached subtree is never recomputed.
+/// The buffer is `madvise`d for huge pages (a no-op where THP is unavailable).
+/// An empty slot is `0`, which no real entry can equal (every key has a non-zero
+/// depth marker in its low byte).
+struct Tt {
+    slots: Vec<u128>,
+    mask: usize,
+    occupancy: usize,
+    max_slots: usize,
+}
+
+impl Tt {
+    fn new(max_slots: usize) -> Tt {
+        let n = (1usize << 14).min(max_slots); // start at 16K slots ≈ 256 KB
+        let slots = vec![0u128; n];
+        advise_hugepages(&slots);
+        Tt {
+            slots,
+            mask: n - 1,
+            occupancy: 0,
+            max_slots,
+        }
+    }
+
+    #[inline]
+    fn encode(key: u128, value: i32, flag: Flag, best: Option<usize>) -> u128 {
+        let v = (value.clamp(i16::MIN as i32, i16::MAX as i32) as i16) as u16 as u128;
+        let f: u128 = match flag {
+            Flag::Exact => 1,
+            Flag::Lower => 2,
+            Flag::Upper => 3,
+        };
+        let bm = best.map_or(15u128, |m| (m as u128) & 15);
+        (key << PAYLOAD_BITS) | v | (f << 16) | (bm << 18)
+    }
+
+    #[inline]
+    fn decode(entry: u128) -> TtProbe {
+        let payload = entry & PAYLOAD_MASK;
+        TtProbe {
+            value: (payload as u16) as i16 as i32,
+            flag: match (payload >> 16) & 3 {
+                1 => Flag::Exact,
+                2 => Flag::Lower,
+                _ => Flag::Upper,
+            },
+            best: match (payload >> 18) & 15 {
+                15 => None,
+                b => Some(b as usize),
+            },
+        }
+    }
+
+    /// Prefetch the cache line for `key`'s home slot (issued for a child before
+    /// recursing, to overlap the DRAM fetch with the child's entry work).
+    #[inline]
+    fn prefetch(&self, key: u128) {
+        #[cfg(target_arch = "x86_64")]
+        unsafe {
+            let idx = (tt_mix(key) as usize) & self.mask;
+            core::arch::x86_64::_mm_prefetch(
+                self.slots.as_ptr().add(idx) as *const i8,
+                core::arch::x86_64::_MM_HINT_T0,
+            );
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        let _ = key;
+    }
+
+    #[inline]
+    fn get(&self, key: u128) -> Option<TtProbe> {
+        let mut i = (tt_mix(key) as usize) & self.mask;
+        for _ in 0..TT_MAX_PROBE {
+            let e = self.slots[i];
+            if e == 0 {
+                return None;
+            }
+            if e >> PAYLOAD_BITS == key {
+                return Some(Self::decode(e));
+            }
+            i = (i + 1) & self.mask;
+        }
+        None
+    }
+
+    fn store(&mut self, key: u128, value: i32, flag: Flag, best: Option<usize>) {
+        if self.occupancy * 20 >= self.slots.len() * TT_GROW_NUM && self.slots.len() < self.max_slots
+        {
+            self.grow();
+        }
+        let entry = Self::encode(key, value, flag, best);
+        let mut i = (tt_mix(key) as usize) & self.mask;
+        for _ in 0..TT_MAX_PROBE {
+            let e = self.slots[i];
+            if e == 0 {
+                self.slots[i] = entry;
+                self.occupancy += 1;
+                return;
+            }
+            if e >> PAYLOAD_BITS == key {
+                self.slots[i] = entry; // refresh in place
+                return;
+            }
+            i = (i + 1) & self.mask;
+        }
+        // Probe chain saturated (only near a full capped table): leave uncached.
+    }
+
+    fn grow(&mut self) {
+        let new_len = self.slots.len() * 2;
+        let old = std::mem::replace(&mut self.slots, vec![0u128; new_len]);
+        advise_hugepages(&self.slots);
+        self.mask = new_len - 1;
+        for &e in &old {
+            if e != 0 {
+                let mut i = (tt_mix(e >> PAYLOAD_BITS) as usize) & self.mask;
+                while self.slots[i] != 0 {
+                    i = (i + 1) & self.mask;
+                }
+                self.slots[i] = e;
+            }
+        }
+    }
+}
 
 /// Seeds-in-play threshold at or below which the exact search consults the
 /// store-independent endgame table instead of recursing. Chosen empirically as
@@ -132,8 +333,7 @@ const ENDGAME_CUTOFF: u32 = 14;
 
 struct Searcher<'a> {
     rules: Rules,
-    tt: TtMap,
-    tt_cap: usize,
+    tt: Tt,
     /// History heuristic: cumulative beta-cutoff weight per `[side][pit]`, used
     /// to order quiet moves. Coarse (only 2 × MAX_PITS buckets) but cheap.
     history: [[u32; MAX_PITS]; 2],
@@ -149,11 +349,16 @@ struct Searcher<'a> {
 }
 
 impl<'a> Searcher<'a> {
-    fn new(rules: Rules, budget: u64, endgame_cutoff: u32, tb: Option<&'a Tablebase>) -> Searcher<'a> {
+    fn new(
+        rules: Rules,
+        budget: u64,
+        endgame_cutoff: u32,
+        tb: Option<&'a Tablebase>,
+        tt_max_slots: usize,
+    ) -> Searcher<'a> {
         Searcher {
             rules,
-            tt: TtMap::default(),
-            tt_cap: TT_MAX_ENTRIES,
+            tt: Tt::new(tt_max_slots),
             history: [[0; MAX_PITS]; 2],
             endgame: Endgame::new(rules, endgame_cutoff),
             tb,
@@ -232,33 +437,51 @@ impl<'a> Searcher<'a> {
         let p = b.turn();
         let n = b.pits_per_side();
         let cells = b.cells();
-        let mut count = 0;
-        for i in 0..n {
-            if cells[b.pit_global(p, i)] > 0 {
-                buf[count] = i as u8;
-                count += 1;
-            }
-        }
         let hist = &self.history[Self::pidx(p)];
-        let moves = &mut buf[..count];
-        moves.sort_by_key(|&mv| {
-            let i = mv as usize;
-            let seeds = cells[b.pit_global(p, i)] as usize;
-            let mut rank = 0i32;
-            if Some(i) == tt_move {
-                rank -= 1_000_000;
+        // Player `p`'s pits are contiguous starting at this global index, so we
+        // can index `base + i` and skip the per-access `pit_global` match.
+        let base = b.pit_global(p, 0);
+        let tt_mv = tt_move.map_or(255u8, |m| m as u8);
+
+        // Score each legal move exactly once (lower score = tried earlier), then
+        // insertion-sort the few moves by their precomputed scores. Computing the
+        // score once — rather than inside a `sort_by_key` comparator that re-runs
+        // it on every comparison — is a large per-node saving (move ordering ran
+        // at every node).
+        let mut count = 0;
+        let mut scores = [0i32; MAX_PITS];
+        for i in 0..n {
+            let seeds = cells[base + i] as usize;
+            if seeds == 0 {
+                continue;
+            }
+            let mut score = -(i as i32); // tie-break: prefer pits nearer the store
+            if i as u8 == tt_mv {
+                score -= 1_000_000;
             }
             // Distance from this pit to the player's own store is `n - i` for
             // both players; a single-lap sow lands in the store when equal.
             if seeds == n - i {
-                rank -= 10_000;
+                score -= 10_000;
             }
             // History: quiet moves that have caused cutoffs sort earlier. Capped
             // so it never outranks the TT or extra-turn moves.
-            rank -= hist[i].min(8_000) as i32;
-            rank -= i as i32; // tie-break: prefer pits nearer the store
-            rank
-        });
+            score -= hist[i].min(8_000) as i32;
+            scores[count] = score;
+            buf[count] = i as u8;
+            count += 1;
+        }
+        for a in 1..count {
+            let (smv, ssc) = (buf[a], scores[a]);
+            let mut j = a;
+            while j > 0 && scores[j - 1] > ssc {
+                scores[j] = scores[j - 1];
+                buf[j] = buf[j - 1];
+                j -= 1;
+            }
+            scores[j] = ssc;
+            buf[j] = smv;
+        }
         count
     }
 
@@ -333,7 +556,7 @@ impl<'a> Searcher<'a> {
         let alpha_orig = alpha;
         let mut tt_move = None;
         if let Some(k) = key {
-            if let Some(e) = self.tt.get(&k) {
+            if let Some(e) = self.tt.get(k) {
                 let val = e.value + sd;
                 match e.flag {
                     Flag::Exact => return val,
@@ -343,7 +566,7 @@ impl<'a> Searcher<'a> {
                 if alpha >= beta {
                     return val;
                 }
-                tt_move = if e.best == 255 { None } else { Some(e.best as usize) };
+                tt_move = e.best;
             }
         }
 
@@ -358,6 +581,12 @@ impl<'a> Searcher<'a> {
         for (idx, &mv) in buf[..count].iter().enumerate() {
             let mv = mv as usize;
             let r = b.apply(&self.rules, mv);
+
+            // Prefetch this child's TT slot now so its DRAM fetch overlaps the
+            // child's own entry work (terminal/cutoff checks) before it probes.
+            if let Some(ck) = Self::key(&r.board, child_depth) {
+                self.tt.prefetch(ck);
+            }
 
             // Principal Variation Search: search the first move with the full
             // window; probe the rest with a null window and only re-search the
@@ -407,20 +636,9 @@ impl<'a> Searcher<'a> {
         } else {
             Flag::Exact
         };
-        // Stop caching once the table is full to keep memory bounded; existing
-        // entries are retained (and overwritten) so most of the cache stays useful.
+        // Cache the store-independent value (subtract `sd`).
         if let Some(k) = key {
-            if self.tt.len() < self.tt_cap || self.tt.contains_key(&k) {
-                self.tt.insert(
-                    k,
-                    TtEntry {
-                        // Store the store-independent value (subtract `sd`).
-                        value: best - sd,
-                        flag,
-                        best: best_move.map_or(255, |m| m as u8),
-                    },
-                );
-            }
+            self.tt.store(k, best - sd, flag, best_move);
         }
         best
     }
@@ -440,8 +658,8 @@ impl<'a> Searcher<'a> {
             // Prefer a best move stored in the main TT; otherwise (inside the
             // endgame tablebase) derive it from the table.
             let from_tt = Self::key(&cur, d)
-                .and_then(|k| self.tt.get(&k))
-                .and_then(|e| (e.best != 255).then_some(e.best as usize));
+                .and_then(|k| self.tt.get(k))
+                .and_then(|e| e.best);
             let mv = match from_tt.or_else(|| self.best_move_via_tb(&cur)) {
                 Some(mv) => mv,
                 None => break,
@@ -610,14 +828,24 @@ pub fn analyze_with_tb(
         0
     };
 
-    let mut exact = Searcher::new(rules, node_budget, endgame_cutoff, tb);
+    let mut exact = Searcher::new(rules, node_budget, endgame_cutoff, tb, TT_MAX_SLOTS_EXACT);
     let result = exact.analyze_root(board, None);
     if !exact.aborted {
+        if std::env::var_os("MANCALA_DIAG").is_some() {
+            eprintln!(
+                "DIAG tt_entries={} tt_slots={} nodes={}",
+                exact.tt.occupancy,
+                exact.tt.slots.len(),
+                exact.nodes
+            );
+        }
         return result;
     }
+    // Release the (large) exact table before the fallback allocates its own.
+    drop(exact);
 
     // Exact search ran out of budget — fall back to a heuristic search.
-    let mut limited = Searcher::new(rules, u64::MAX, 0, None);
+    let mut limited = Searcher::new(rules, u64::MAX, 0, None, 1 << 22);
     limited.analyze_root(board, Some(fallback_depth))
 }
 
