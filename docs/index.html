@@ -19,11 +19,11 @@
     <label title="Allow a capture even when the opposite pit is empty">
       <input id="captureEmpty" type="checkbox" /> capture-empty rule
     </label>
-    <label title="Max search nodes before falling back to a heuristic estimate">
-      Budget <select id="budget">
-        <option value="2000000">2M (fast)</option>
-        <option value="20000000" selected>20M</option>
-        <option value="80000000">80M (slow)</option>
+    <label title="How hard to try for an exact result before falling back to a heuristic estimate. Bigger budgets only help positions that can actually be solved within them.">
+      Effort <select id="budget">
+        <option value="2000000" selected>2M — fast (~1s)</option>
+        <option value="20000000">20M — deeper (~10s)</option>
+        <option value="80000000">80M — deepest (~40s)</option>
       </select>
     </label>
     <button id="newGame">New game</button>
@@ -35,6 +35,7 @@
   <section class="actions">
     <button id="analyze">Analyze</button>
     <button id="playBest" disabled>Play best move</button>
+    <button id="stop" hidden>Stop</button>
     <span id="turnLabel" class="turn"></span>
   </section>
 

@@ -121,11 +121,18 @@ const CELL_BITS: u32 = 6;
 const PAYLOAD_BITS: u32 = 22;
 const PAYLOAD_MASK: u128 = (1 << PAYLOAD_BITS) - 1;
 
-/// Maximum slots for the exact table (each is 16 B). 2^28 slots is 4.3 GB and
-/// holds well over the std map's 180M-entry cap — in half the memory — so far
-/// fewer positions are dropped and re-searched. (Peak during the final doubling
-/// is ≈6.4 GB, within budget.)
+/// Maximum slots for the exact table (each is 16 B). On 64-bit hosts 2^28 slots
+/// is 4.3 GB and holds well over the std map's 180M-entry cap — in half the
+/// memory — so far fewer positions are dropped and re-searched. (Peak during the
+/// final doubling is ≈6.4 GB, within budget.)
+#[cfg(target_pointer_width = "64")]
 const TT_MAX_SLOTS_EXACT: usize = 1 << 28;
+
+/// On 32-bit hosts (notably wasm32 in the browser, where the whole address space
+/// is ≤ 4 GB and over-allocating crashes the page) the table is capped at 2^24
+/// slots = 256 MB. Beyond it the search just caches less — slower, never OOM.
+#[cfg(not(target_pointer_width = "64"))]
+const TT_MAX_SLOTS_EXACT: usize = 1 << 24;
 
 /// Grow (while below the cap) when entries reach this fraction (×/20) of slots,
 /// keeping probe chains short and the table proportional to the working set so

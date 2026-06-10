@@ -45,7 +45,9 @@ dependencies.
 The engine also compiles to **WebAssembly**, so it runs entirely client-side —
 an interactive board where you play moves and the solver shows the exact result,
 best move, per-move table, and principal variation. Everything in [`docs/`](docs/)
-is a static site (HTML/CSS/JS + a ~78 KB `mancala.wasm`).
+is a static site (HTML/CSS/JS + a ~90 KB `mancala.wasm`). The analysis runs in a
+**Web Worker** so a long search never freezes the page — the board stays
+responsive and a **Stop** button abandons a search in progress.
 
 Try it locally:
 
@@ -61,13 +63,16 @@ deployment → Source: Deploy from a branch*, then pick your branch and the
 prebuilt wasm is committed; rerun `docs/build.sh` to refresh it after engine
 changes.
 
-In the browser the solver uses the in-memory search with a node **budget**
-(selectable). A small **6-pit endgame tablebase** (`docs/kalah6.bin`, ~5 MB,
-≤ 12 seeds in play) ships with the page and is loaded on startup, so 6-pit
-endgames are solved **exactly and instantly** and mid-game positions resolve
-exactly far more often. Positions still too big for the budget (e.g. Kalah(6,4)
-straight from the opening) fall back to a clearly-labelled heuristic estimate —
-the high-cap tablebases that would solve those aren't shipped to the browser.
+In the browser the solver uses the in-memory search with a selectable **effort**
+(node budget: 2M / 20M / 80M). A small **6-pit endgame tablebase**
+(`docs/kalah6.bin`, ~5 MB, ≤ 12 seeds in play) ships with the page and is loaded
+on startup, so 6-pit endgames are solved **exactly and instantly** and mid-game
+positions resolve exactly far more often. Positions still too big for the budget
+(e.g. Kalah(6,4) straight from the opening) fall back to a clearly-labelled
+heuristic estimate — the high-cap tablebases that would solve those aren't
+shipped to the browser. The browser transposition table is memory-capped (the
+dense table tops out at 256 MB), so a deep search slows down rather than
+crashing the tab — the earlier out-of-memory at the highest effort is fixed.
 Rebuild the bundled table with
 `mancala-solver gen-tb --pits 6 --seeds-cap 12 --out docs/kalah6.bin`.
 
