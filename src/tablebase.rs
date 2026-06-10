@@ -7,22 +7,27 @@
 //! separate command, written to disk, then memory-loaded and queried in O(1)
 //! during any later search.
 //!
-//! # Indexing
+//! # Indexing (mirror-canonical)
 //!
-//! A pit layout is the `2N` pit counts (player 0's pits then player 1's). Layouts
-//! with total ≤ `cap` are enumerated as integer compositions and mapped to a
-//! dense index via the combinatorial number system, so the on-disk form is just
-//! a flat `[i16]` — no keys stored. `data[side * num_layouts + rank(pits)]` is
-//! `g` for that layout and side to move.
+//! A pit layout is the `2N` pit counts packed **mover-first** (the side to
+//! move's pits, then the opponent's). Kalah is player-symmetric, so the value of
+//! "the mover holds `A` against `B`" is independent of *which* player the mover
+//! is — indexing mover-first makes the two mirror positions share one entry and
+//! **halves the table** relative to keying on (P0, P1, side).
+//!
+//! Layouts with total ≤ `cap` are enumerated as integer compositions and mapped
+//! to a dense index via the combinatorial number system, so the on-disk form is
+//! just a flat `[i16]` — no keys stored. `data[rank(mover_pits ++ opp_pits)]`
+//! is `g` from the mover's perspective.
 //!
 //! # File format (little-endian)
 //!
 //! ```text
-//! magic        : 8 bytes  = b"KALATB01"
+//! magic        : 8 bytes  = b"KALATB02"
 //! pits_per_side: u32
 //! seeds_cap    : u32
 //! num_layouts  : u64       (= C(cap + 2N, 2N))
-//! data         : i16 * (2 * num_layouts)
+//! data         : i16 * num_layouts
 //! ```
 
 use std::fs::File;
@@ -30,10 +35,10 @@ use std::io::{self, BufReader, BufWriter, Read, Write};
 use std::path::Path;
 use std::sync::Mutex;
 
-use crate::board::{Board, Player, Rules};
+use crate::board::{Board, Rules, MAX_CELLS};
 use crate::hash::U128Map;
 
-const MAGIC: &[u8; 8] = b"KALATB01";
+const MAGIC: &[u8; 8] = b"KALATB02";
 
 /// Number of shards in the concurrent build memo (low lock contention).
 const BUILD_SHARDS: usize = 512;
@@ -47,18 +52,20 @@ fn mix(key: u128) -> u64 {
     h
 }
 
-/// Store-independent key (pit layout + side to move), 6 bits per pit.
+/// Store-independent, mirror-canonical key: the mover's pits then the
+/// opponent's, 6 bits per pit (no turn bit — mirrors share the key, and `g` is
+/// mover-perspective so values transfer verbatim).
 fn g_key(b: &Board) -> u128 {
     let n = b.pits_per_side();
     let cells = b.cells();
+    let mover = b.turn();
     let mut k = 0u128;
-    for i in 0..n {
-        k = (k << 6) | cells[b.pit_global(Player::P0, i)] as u128;
+    for p in [mover, mover.other()] {
+        for i in 0..n {
+            k = (k << 6) | cells[b.pit_global(p, i)] as u128;
+        }
     }
-    for i in 0..n {
-        k = (k << 6) | cells[b.pit_global(Player::P1, i)] as u128;
-    }
-    (k << 1) | if b.turn() == Player::P1 { 1 } else { 0 }
+    k
 }
 
 /// Compute the store-independent future differential `g` for `b`, memoised into
@@ -167,19 +174,21 @@ impl Tablebase {
     }
 
     /// Number of `g` entries the table would hold for `(pits_per_side, cap)`,
-    /// useful for sizing checks before building.
+    /// useful for sizing checks before building. Thanks to mirror canonicalization
+    /// one entry serves both sides, so this is just the layout count.
     pub fn entry_count(pits_per_side: usize, cap: u32) -> u64 {
-        2 * num_layouts(cap as u64, 2 * pits_per_side as u64)
+        num_layouts(cap as u64, 2 * pits_per_side as u64)
     }
 
     /// Build the tablebase for every layout with ≤ `cap` seeds in play, using
-    /// all available cores.
+    /// all available cores. Each enumerated layout is read as (mover pits,
+    /// opponent pits); mirror symmetry means no per-side pass is needed.
     pub fn build(rules: Rules, pits_per_side: usize, cap: u32) -> Tablebase {
         let m = 2 * pits_per_side;
         let total = num_layouts(cap as u64, m as u64) as usize;
 
         // Fill a sharded, store-independent `g` memo in parallel. Each thread
-        // owns the (layout, side) pairs whose enumeration index is `≡ t`.
+        // owns the layouts whose enumeration index is `≡ t`.
         let memo: Vec<Mutex<U128Map<i16>>> =
             (0..BUILD_SHARDS).map(|_| Mutex::new(U128Map::default())).collect();
         let nthreads = std::thread::available_parallelism()
@@ -194,37 +203,32 @@ impl Tablebase {
                     let mut pits = vec![0u8; m];
                     let mut idx = 0usize;
                     Self::for_each_layout(cap, &mut pits, &mut |layout| {
-                        for side in 0..2u8 {
-                            if idx % nthreads == t {
-                                let board = layout_board(pits_per_side, layout, side);
-                                solve_g(&board, &rules, memo);
-                            }
-                            idx += 1;
+                        if idx % nthreads == t {
+                            let board = layout_board(pits_per_side, layout);
+                            solve_g(&board, &rules, memo);
                         }
+                        idx += 1;
                     });
                 });
             }
         });
 
         // Transcribe the memo into the dense, rank-indexed array.
-        let mut data = vec![0i16; 2 * total];
+        let mut data = vec![0i16; total];
         let mut pits = vec![0u8; m];
         Self::for_each_layout(cap, &mut pits, &mut |layout| {
-            let r = rank(layout) as usize;
-            for side in 0..2u8 {
-                let board = layout_board(pits_per_side, layout, side);
-                // Terminal layouts return before being memoised (their value is
-                // the immediate sweep); compute them directly here.
-                let v = if board.is_terminal() {
-                    let p = board.turn();
-                    board.pit_seeds(p) as i16 - board.pit_seeds(p.other()) as i16
-                } else {
-                    let key = g_key(&board);
-                    let shard = &memo[(mix(key) as usize) % BUILD_SHARDS];
-                    *shard.lock().unwrap().get(&key).expect("non-terminal memo filled")
-                };
-                data[side as usize * total + r] = v;
-            }
+            let board = layout_board(pits_per_side, layout);
+            // Terminal layouts return before being memoised (their value is
+            // the immediate sweep); compute them directly here.
+            let v = if board.is_terminal() {
+                let p = board.turn();
+                board.pit_seeds(p) as i16 - board.pit_seeds(p.other()) as i16
+            } else {
+                let key = g_key(&board);
+                let shard = &memo[(mix(key) as usize) % BUILD_SHARDS];
+                *shard.lock().unwrap().get(&key).expect("non-terminal memo filled")
+            };
+            data[rank(layout) as usize] = v;
         });
 
         Tablebase {
@@ -256,21 +260,22 @@ impl Tablebase {
         rec(0, cap, pits, f);
     }
 
-    /// Look up `g` for a position, if its seed count is within the table and the
-    /// board size matches. Returns `None` otherwise.
+    /// Look up `g` (mover-perspective) for a position, if its seed count is
+    /// within the table and the board size matches. Returns `None` otherwise.
+    /// Mirror-canonical: works for either side to move via the same entry.
     pub fn lookup(&self, b: &Board) -> Option<i16> {
         if b.pits_per_side() != self.pits_per_side || b.seeds_in_play() > self.cap {
             return None;
         }
         let n = self.pits_per_side;
-        let mut pits = vec![0u8; 2 * n];
+        let cells = b.cells();
+        let mover = b.turn();
+        let mut pits = [0u8; MAX_CELLS];
         for i in 0..n {
-            pits[i] = b.cells()[b.pit_global(Player::P0, i)];
-            pits[n + i] = b.cells()[b.pit_global(Player::P1, i)];
+            pits[i] = cells[b.pit_global(mover, i)];
+            pits[n + i] = cells[b.pit_global(mover.other(), i)];
         }
-        let side = if b.turn() == Player::P1 { 1 } else { 0 };
-        let r = rank(&pits);
-        Some(self.data[side * self.num_layouts as usize + r as usize])
+        Some(self.data[rank(&pits[..2 * n]) as usize])
     }
 
     /// Serialize to `path`.
@@ -310,7 +315,7 @@ impl Tablebase {
         let pits_per_side = read_u32(&mut r)? as usize;
         let cap = read_u32(&mut r)?;
         let num_layouts = read_u64(&mut r)?;
-        let count = 2 * num_layouts as usize;
+        let count = num_layouts as usize;
         let mut data = vec![0i16; count];
         let mut buf = [0u8; 2];
         for slot in data.iter_mut() {
@@ -338,20 +343,34 @@ fn read_u64(r: &mut impl Read) -> io::Result<u64> {
     Ok(u64::from_le_bytes(b))
 }
 
-/// Build a zero-store board from a pit layout (`P0` pits then `P1` pits).
-fn layout_board(pits_per_side: usize, layout: &[u8], side: u8) -> Board {
+/// Build a zero-store board from a canonical layout (mover pits then opponent
+/// pits), with `P0` as the mover. By mirror symmetry this one orientation covers
+/// both sides.
+fn layout_board(pits_per_side: usize, layout: &[u8]) -> Board {
     let n = pits_per_side;
     let mut cells = vec![0u8; 2 * n + 2];
-    cells[..n].copy_from_slice(&layout[..n]); // P0 pits
-    cells[n + 1..2 * n + 1].copy_from_slice(&layout[n..2 * n]); // P1 pits
-    let turn = if side == 1 { Player::P1 } else { Player::P0 };
-    Board::new(n, cells, turn).expect("valid layout board")
+    cells[..n].copy_from_slice(&layout[..n]); // mover (P0) pits
+    cells[n + 1..2 * n + 1].copy_from_slice(&layout[n..2 * n]); // opponent (P1) pits
+    Board::new(n, cells, crate::board::Player::P0).expect("valid layout board")
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::board::Player;
     use crate::endgame::Endgame;
+
+    /// Board with the given mover/opponent pits and `turn` to move (zero stores).
+    fn board_for(n: usize, mover: &[u8], opp: &[u8], turn: Player) -> Board {
+        let mut cells = vec![0u8; 2 * n + 2];
+        let (p0, p1) = match turn {
+            Player::P0 => (mover, opp),
+            Player::P1 => (opp, mover),
+        };
+        cells[..n].copy_from_slice(p0);
+        cells[n + 1..2 * n + 1].copy_from_slice(p1);
+        Board::new(n, cells, turn).unwrap()
+    }
 
     #[test]
     fn rank_is_a_bijection() {
@@ -372,17 +391,31 @@ mod tests {
 
     #[test]
     fn tablebase_matches_lazy_g() {
-        // Built values must equal the lazy endgame `g` for every covered layout.
+        // Built values must equal the lazy endgame `g` for every covered layout,
+        // with either player as the mover (exercising mirror canonicalization).
         let rules = Rules::default();
         let tb = Tablebase::build(rules, 2, 6);
         let mut eg = Endgame::new(rules, 6);
         let mut pits = vec![0u8; 4];
-        for side in 0..2u8 {
+        for turn in [Player::P0, Player::P1] {
             Tablebase::for_each_layout(6, &mut pits, &mut |layout| {
-                let board = layout_board(2, layout, side);
+                let board = board_for(2, &layout[..2], &layout[2..], turn);
                 assert_eq!(tb.lookup(&board), Some(eg.g(&board)));
             });
         }
+    }
+
+    #[test]
+    fn lookup_is_mirror_symmetric() {
+        // The same (mover, opponent) pits must hit the same entry regardless of
+        // which player is the mover.
+        let tb = Tablebase::build(Rules::default(), 2, 6);
+        let mut pits = vec![0u8; 4];
+        Tablebase::for_each_layout(6, &mut pits, &mut |layout| {
+            let as_p0 = board_for(2, &layout[..2], &layout[2..], Player::P0);
+            let as_p1 = board_for(2, &layout[..2], &layout[2..], Player::P1);
+            assert_eq!(tb.lookup(&as_p0), tb.lookup(&as_p1));
+        });
     }
 
     #[test]

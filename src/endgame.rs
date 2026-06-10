@@ -26,7 +26,7 @@
 //! when the turn passes — standard negamax). Recursion terminates because Kalah
 //! itself always terminates, so the pit-only state graph is acyclic.
 
-use crate::board::{Board, Player, Rules};
+use crate::board::{Board, Rules};
 use crate::hash::U128Map;
 
 /// Bits used to encode each pit in the endgame key. A pit can hold at most the
@@ -64,16 +64,19 @@ impl Endgame {
 
     /// Key on the pit cells (both sides) plus the side to move; stores excluded.
     fn key(b: &Board) -> u128 {
+        // Mirror-canonical: mover's pits first, no turn bit. Kalah is
+        // player-symmetric and `g` is mover-perspective, so both mirrors of a
+        // (mover, opponent) layout share one entry.
         let n = b.pits_per_side();
         let cells = b.cells();
+        let mover = b.turn();
         let mut k = 0u128;
-        for i in 0..n {
-            k = (k << PIT_BITS) | cells[b.pit_global(Player::P0, i)] as u128;
+        for p in [mover, mover.other()] {
+            for i in 0..n {
+                k = (k << PIT_BITS) | cells[b.pit_global(p, i)] as u128;
+            }
         }
-        for i in 0..n {
-            k = (k << PIT_BITS) | cells[b.pit_global(Player::P1, i)] as u128;
-        }
-        (k << 1) | if b.turn() == Player::P1 { 1 } else { 0 }
+        k
     }
 
     /// Optimal future store differential (mover minus opponent) from `b`,
@@ -115,6 +118,7 @@ impl Endgame {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::board::Player;
 
     /// `g` of the start position equals the full-game margin from a zero-store
     /// board, which must match the known Kalah(3,3) value (+2).
