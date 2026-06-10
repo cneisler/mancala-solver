@@ -217,6 +217,28 @@ mancala-solver start --pits 6 --seeds 4 --tb kalah6.tb --budget 100000000000
 Higher caps cover more of the search tree (faster solves of hard boards like
 Kalah(6,4)) at the cost of a larger one-time build and file.
 
+## Opening book
+
+The endgame tablebase cuts the search off at the **bottom** (few seeds left); an
+opening book cuts it off at the **top** (the first few plies). Unlike the
+endgame — whose ≤cap positions are a small closed set — an early position's exact
+value depends on the whole tree beneath it, so a *proven* book can't make the
+**first** solve faster. It is a cheap **byproduct** of solving once: the layouts
+reachable within a few plies of the opening are solved together with one warm
+transposition table, and the result makes the opening / early game an **O(1)
+exact lookup** afterward. Entries are mirror-canonical and store-independent,
+exactly like the tablebase.
+
+```sh
+# Build (needs an endgame tablebase) and then use it: the opening is now instant.
+mancala-solver gen-book --pits 6 --seeds 4 --plies 2 --tb kalah6.tb --out kalah6_book.bin
+mancala-solver start --pits 6 --seeds 4 --book kalah6_book.bin --tb kalah6.tb
+```
+
+This is what lets the **web UI** show the exact "win by 8, best pit 2" for the
+opening instantly, instead of the heuristic estimate it would otherwise fall back
+to (the browser ships only a small endgame table).
+
 ## Measuring playing strength
 
 For positions too large to solve exactly, strength only shows up over many
@@ -246,11 +268,14 @@ can reuse it:
   position analysis.
 - `src/endgame.rs` — lazily-built, store-independent in-memory endgame table.
 - `src/tablebase.rs` — offline endgame tablebase: parallel build, save, load, lookup.
+- `src/book.rs` — proven opening book: build (warm-TT solves), lookup, exact
+  early-game analysis, save/load.
 - `src/hash.rs` — fast `u128`-key hasher shared by the TT and endgame tables.
 - `src/notation.rs` — board-notation parsing/formatting.
 - `src/playtest.rs` — self-play strength testing: opening book, match runner,
   Elo / confidence-interval / likelihood-of-superiority statistics.
-- `src/main.rs` — the `mancala-solver` CLI (`analyze`, `start`, `gen-tb`, `playtest`).
+- `src/main.rs` — the `mancala-solver` CLI (`analyze`, `start`, `gen-tb`,
+  `gen-book`, `playtest`).
 
 ## Tests
 

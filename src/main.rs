@@ -766,6 +766,7 @@ COMMANDS:
     analyze   Analyze a position given in board notation
     start     Analyze the standard opening for a given board size
     gen-tb    Build an offline endgame tablebase and write it to disk
+    gen-book  Build a proven opening book (early-game exact lookups)
     playtest  Play two engine configs against each other and report Elo
     help      Show this help
 
@@ -792,6 +793,13 @@ GEN-TB:
     Precomputes exact endgame values for every pit layout with up to
     <seeds-cap> seeds in play, writing a tablebase file. Pass it to analyze/start
     with --tb to make those endgame positions O(1) lookups.
+
+GEN-BOOK:
+    mancala-solver gen-book --pits 6 --seeds 4 --plies 2 --tb kalah6.tb --out kalah6_book.bin
+
+    Solves every layout reachable within <plies> moves of the opening (reusing
+    one warm table) and writes a proven opening book. Pass it to analyze/start
+    with --book to make those early positions instant exact lookups.
 
 PLAYTEST:
     mancala-solver playtest --a h:8 --b h:6 [--games 1000] [OPTIONS]
