@@ -430,8 +430,11 @@ impl<'a> Searcher<'a> {
         let cells = b.cells();
         let store_independent = depth.is_none();
         let included = if store_independent { 2 * n } else { 2 * n + 2 };
-        // Bits: cells (CELL_BITS each) + 8 depth-marker bits.
-        if included as u32 * CELL_BITS + 8 > 128 {
+        // Bits: cells (CELL_BITS each) + 8 depth-marker bits. The key is packed
+        // into a slot as `(key << PAYLOAD_BITS) | payload`, so it must also leave
+        // room for the payload — otherwise the shift silently truncates the high
+        // bits and aliases distinct positions to the same key.
+        if included as u32 * CELL_BITS + 8 + PAYLOAD_BITS > 128 {
             return None;
         }
         let mut packed: u128 = 0;
