@@ -999,9 +999,10 @@ pub fn analyze_with_tb(
     // Release the (large) exact table before the fallback allocates its own.
     drop(exact);
 
-    // Exact search ran out of budget — fall back to a heuristic search.
-    let mut limited = Searcher::new(rules, u64::MAX, 0, None, 1 << 22);
-    limited.analyze_root(board, Some(fallback_depth))
+    // Too big to prove within budget — play it with the strong play engine
+    // (endgame tablebase / lazy endgame for perfect endgames, plus quiescence),
+    // not the bare static heuristic.
+    play_search(board, rules, tb, Limit::Depth(fallback_depth), true, true, true)
 }
 
 /// A thinking limit for the play search.
