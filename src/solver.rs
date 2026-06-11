@@ -12,6 +12,8 @@
 //! move). Heuristic values use an internal scale dominated by the store
 //! difference and are not directly comparable to exact seed margins.
 
+use std::time::Instant;
+
 use crate::board::{Board, Player, Rules, MAX_PITS};
 use crate::endgame::Endgame;
 use crate::tablebase::Tablebase;
@@ -361,6 +363,9 @@ struct Searcher<'a> {
     quiesce: bool,
     nodes: u64,
     budget: u64,
+    /// Optional wall-clock deadline (for time-controlled play); checked
+    /// periodically so the overhead is negligible.
+    deadline: Option<Instant>,
     aborted: bool,
 }
 
@@ -381,8 +386,24 @@ impl<'a> Searcher<'a> {
             quiesce: false,
             nodes: 0,
             budget,
+            deadline: None,
             aborted: false,
         }
+    }
+
+    /// Whether the search should stop now (node budget spent or deadline passed).
+    /// The clock is read only every 4096 nodes to keep the check ~free.
+    #[inline]
+    fn out_of_budget(&self) -> bool {
+        if self.nodes > self.budget {
+            return true;
+        }
+        if let Some(dl) = self.deadline {
+            if self.nodes & 0xFFF == 0 && Instant::now() >= dl {
+                return true;
+            }
+        }
+        false
     }
 
     /// Transposition-table key: the seed counts packed **mover-first**, plus a
@@ -553,7 +574,7 @@ impl<'a> Searcher<'a> {
     /// stand-pat floor, as in standard quiescence).
     fn quiesce(&mut self, b: &Board, mut alpha: i32, beta: i32) -> i32 {
         self.nodes += 1;
-        if self.nodes > self.budget {
+        if self.out_of_budget() {
             self.aborted = true;
             return 0;
         }
@@ -604,7 +625,7 @@ impl<'a> Searcher<'a> {
     /// `depth == Some(d)` searches `d` plies then applies the heuristic.
     fn search(&mut self, b: &Board, mut alpha: i32, mut beta: i32, depth: Option<u32>) -> i32 {
         self.nodes += 1;
-        if self.nodes > self.budget {
+        if self.out_of_budget() {
             self.aborted = true;
             return 0;
         }
@@ -942,10 +963,15 @@ pub fn analyze_with_tb(
 pub enum Limit {
     /// Search exactly this many plies.
     Depth(u32),
-    /// Iteratively deepen until this many search nodes have been visited,
-    /// returning the deepest fully-completed iteration (an anytime search, so
-    /// two engines can be compared on equal *work* rather than equal depth).
+    /// Iteratively deepen until this many search nodes have been visited.
+    /// Reproducible (deterministic), but ignores per-node cost — so it favors
+    /// heavier evaluations. Good for fast iteration on changes that don't alter
+    /// per-node cost.
     Nodes(u64),
+    /// Iteratively deepen until this many milliseconds have elapsed. The honest
+    /// measure (it docks a slow eval the nodes it can't afford), but
+    /// nondeterministic. Use for any change that alters per-node cost.
+    Time(u64),
 }
 
 /// Play search: depth-limited / node-budgeted alpha-beta with the heuristic at
@@ -973,17 +999,20 @@ pub fn play_search(
     };
     let budget = match limit {
         Limit::Nodes(n) => n,
-        Limit::Depth(_) => u64::MAX,
+        Limit::Depth(_) | Limit::Time(_) => u64::MAX,
     };
     let mut s = Searcher::new(rules, budget, endgame_cutoff, tb, 1 << 24);
     s.quiesce = quiesce;
+    if let Limit::Time(ms) = limit {
+        s.deadline = Some(Instant::now() + std::time::Duration::from_millis(ms));
+    }
 
     match limit {
         Limit::Depth(d) => s.analyze_root(board, Some(d.max(1))),
-        Limit::Nodes(_) => {
+        Limit::Nodes(_) | Limit::Time(_) => {
             // Iterative deepening: keep the deepest iteration that finished within
-            // budget (nodes accumulate across iterations, so the budget bounds the
-            // whole search). If even depth 1 overruns a tiny budget, keep it anyway.
+            // budget (nodes/time accumulate across iterations). If even depth 1
+            // overruns a tiny budget, keep it anyway.
             let mut best: Option<Analysis> = None;
             for depth in 1..=64u32 {
                 let a = s.analyze_root(board, Some(depth));

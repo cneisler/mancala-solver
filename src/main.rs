@@ -888,8 +888,9 @@ PLAYTEST:
     confidence interval, and the likelihood A is stronger. Engine specs:
         h:<depth>             depth-limited heuristic search
         a:<budget>:<depth>    exact within <budget> nodes, else heuristic
-    Limits: '<d>'/'d<d>' = depth, 'n<nodes>' = node budget (iterative deepening,
-    so engines compare on equal work, not equal depth — e.g. 'q:n100000').
+    Limits: '<d>'/'d<d>' = depth, 'n<nodes>' = node budget, 't<ms>' = time budget
+    (iterative deepening). Compare on equal time ('q:t50') — the fair measure for
+    eval/quiescence changes — or equal nodes ('q:n100000') for reproducibility.
     Options: --pits N --seeds S --sizes 5x4,6x4,7x5,8x6 (multi-size gauntlet)
              --games N --opening-plies K --seed X --threads N --tb <file>
              --tb-cap N --no-tb --capture-empty

@@ -69,10 +69,13 @@ impl Engine {
     }
 }
 
-/// Parse a limit token: `n<nodes>` → node budget; `d<n>` or bare `<n>` → depth.
+/// Parse a limit token: `n<nodes>` → node budget; `t<ms>` → time budget;
+/// `d<n>` or bare `<n>` → depth.
 fn parse_limit(tok: &str, spec: &str) -> Result<Limit, String> {
     if let Some(n) = tok.strip_prefix('n') {
         Ok(Limit::Nodes(n.parse().map_err(|_| format!("bad node budget in '{spec}'"))?))
+    } else if let Some(t) = tok.strip_prefix('t') {
+        Ok(Limit::Time(t.parse().map_err(|_| format!("bad time budget (ms) in '{spec}'"))?))
     } else {
         let d = tok.strip_prefix('d').unwrap_or(tok);
         Ok(Limit::Depth(d.parse().map_err(|_| format!("bad depth in '{spec}'"))?))
