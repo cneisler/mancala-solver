@@ -346,6 +346,46 @@ fn resolve_tablebase(board: &Board, opts: &CommonOpts) -> Result<Option<Tablebas
     Ok(Some(tb))
 }
 
+/// Largest endgame cap whose table for `pits` stays within a memory budget
+/// (~80M entries ≈ 160 MB), used to auto-size a per-board-size tablebase for
+/// playtesting. Bigger boards get a smaller cap; the build stays bounded.
+fn playtest_tb_cap(pits: usize) -> u32 {
+    const MAX_ENTRIES: u64 = 80_000_000;
+    let mut cap = 1;
+    for c in 1..=24 {
+        if Tablebase::entry_count(pits, c) <= MAX_ENTRIES {
+            cap = c;
+        } else {
+            break;
+        }
+    }
+    cap
+}
+
+/// Load a cached per-size tablebase, or build it (and cache it) on first use.
+fn playtest_auto_tb(pits: usize, cap: u32, rules: Rules) -> Result<Tablebase, String> {
+    let path = auto_tb_path(pits, cap, &rules);
+    if path.exists() {
+        if let Ok(tb) = Tablebase::load(&path) {
+            if tb.pits_per_side() == pits && tb.cap() == cap {
+                eprintln!("tablebase: {} (cached, cap {cap})", path.display());
+                return Ok(tb);
+            }
+        }
+    }
+    eprintln!(
+        "tablebase: building {} (cap {cap}, {} entries; one-time) ...",
+        path.display(),
+        Tablebase::entry_count(pits, cap)
+    );
+    let tb = Tablebase::build(rules, pits, cap);
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let _ = tb.save(&path);
+    Ok(tb)
+}
+
 /// Directory for cached auto-tablebases (`$MANCALA_TB_DIR`, default `.mancala_tb`).
 fn auto_tb_dir() -> PathBuf {
     std::env::var_os("MANCALA_TB_DIR")
@@ -488,6 +528,8 @@ fn cmd_playtest(args: &[String]) -> Result<(), String> {
     let mut seed: u64 = 1;
     let mut rules = Rules::default();
     let mut tb_path: Option<String> = None;
+    let mut tb_cap: Option<u32> = None;
+    let mut no_tb = false;
     let mut threads: usize = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1);
 
     let mut iter = args.iter();
@@ -526,6 +568,14 @@ fn cmd_playtest(args: &[String]) -> Result<(), String> {
                     .map_err(|_| "--threads must be a positive integer".to_string())?
             }
             "--tb" => tb_path = Some(take_value(arg, &mut iter)?.to_string()),
+            "--tb-cap" => {
+                tb_cap = Some(
+                    take_value(arg, &mut iter)?
+                        .parse()
+                        .map_err(|_| "--tb-cap must be a non-negative integer".to_string())?,
+                )
+            }
+            "--no-tb" => no_tb = true,
             "--capture-empty" => rules.capture_requires_nonempty_opposite = false,
             other => return Err(format!("unknown flag '{other}' for 'playtest'")),
         }
@@ -536,18 +586,22 @@ fn cmd_playtest(args: &[String]) -> Result<(), String> {
     // Each opening is played from both sides, so two games per opening.
     let openings = games.div_ceil(2).max(1);
 
-    let tb = match &tb_path {
-        Some(p) => {
-            let t = Tablebase::load(Path::new(p)).map_err(|e| format!("failed to load tablebase '{p}': {e}"))?;
-            if t.pits_per_side() != pits {
-                return Err(format!(
-                    "tablebase is for {}-pit boards, but --pits {pits}",
-                    t.pits_per_side()
-                ));
-            }
-            Some(t)
+    // Resolve the endgame tablebase the play engines consult: an explicit --tb,
+    // an auto-built/cached per-size one (default), or none.
+    let tb = if let Some(p) = &tb_path {
+        let t = Tablebase::load(Path::new(p)).map_err(|e| format!("failed to load tablebase '{p}': {e}"))?;
+        if t.pits_per_side() != pits {
+            return Err(format!(
+                "tablebase is for {}-pit boards, but --pits {pits}",
+                t.pits_per_side()
+            ));
         }
-        None => None,
+        Some(t)
+    } else if no_tb {
+        None
+    } else {
+        let cap = tb_cap.unwrap_or_else(|| playtest_tb_cap(pits));
+        Some(playtest_auto_tb(pits, cap, rules)?)
     };
 
     let cfg = MatchConfig {
