@@ -338,6 +338,12 @@ impl Tt {
 /// prunes.
 const ENDGAME_CUTOFF: u32 = 14;
 
+/// Seeds-in-play cutoff for the **play** engine's lazy endgame oracle when no
+/// precomputed tablebase is supplied. Smaller than the solver's cutoff because
+/// the lazy `g` is recomputed per move during a game; this keeps it cheap while
+/// still giving perfect endgames on any board size.
+const PLAY_ENDGAME_CUTOFF: u32 = 12;
+
 struct Searcher<'a> {
     rules: Rules,
     tt: Tt,
@@ -943,7 +949,11 @@ pub fn analyze_play(
     quiesce: bool,
 ) -> Analysis {
     let tb = tb.filter(|t| t.pits_per_side() == board.pits_per_side());
-    let mut s = Searcher::new(rules, u64::MAX, 0, tb, 1 << 24);
+    // Perfect endgame on ANY board size: use the precomputed tablebase if one is
+    // supplied, otherwise the lazy in-memory endgame (computed on the fly for any
+    // size) up to a feasible seed cutoff.
+    let endgame_cutoff = if tb.is_some() { 0 } else { PLAY_ENDGAME_CUTOFF };
+    let mut s = Searcher::new(rules, u64::MAX, endgame_cutoff, tb, 1 << 24);
     s.quiesce = quiesce;
     s.analyze_root(board, Some(depth.max(1)))
 }
