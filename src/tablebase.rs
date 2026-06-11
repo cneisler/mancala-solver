@@ -33,7 +33,7 @@
 use std::fs::File;
 use std::io::{self, BufReader, BufWriter, Read, Write};
 use std::path::Path;
-use std::sync::Mutex;
+use std::sync::{Mutex, OnceLock};
 
 use crate::board::{Board, Rules, MAX_CELLS};
 use crate::hash::U128Map;
@@ -100,10 +100,43 @@ fn solve_g(b: &Board, rules: &Rules, memo: &[Mutex<U128Map<i16>>]) -> i16 {
     best
 }
 
-/// `C(n, k)` for small `n`, computed with a `u128` accumulator to avoid overflow.
+/// Side length of the precomputed Pascal triangle. Ranking a layout only ever
+/// indexes `C(n, k)` with `n ≤ cap + 2·pits`; for the supported caps (a pit
+/// holds < 64 seeds) and board sizes this stays well under 128.
+const PASCAL_N: usize = 128;
+
+/// Lazily-built Pascal triangle `C(n, k)` for `n, k < PASCAL_N`, row-major.
+/// Middle entries that overflow `u64` saturate — those huge binomials are never
+/// read (rank only uses small-`k` columns), so saturation only avoids a panic
+/// during construction.
+static PASCAL: OnceLock<Vec<u64>> = OnceLock::new();
+
+fn pascal() -> &'static [u64] {
+    PASCAL
+        .get_or_init(|| {
+            let mut t = vec![0u64; PASCAL_N * PASCAL_N];
+            for n in 0..PASCAL_N {
+                t[n * PASCAL_N] = 1; // C(n, 0)
+                for k in 1..=n {
+                    let above = t[(n - 1) * PASCAL_N + k];
+                    let left = t[(n - 1) * PASCAL_N + (k - 1)];
+                    t[n * PASCAL_N + k] = above.saturating_add(left);
+                }
+            }
+            t
+        })
+        .as_slice()
+}
+
+/// `C(n, k)`. O(1) via the Pascal table for `n < PASCAL_N`; falls back to a
+/// `u128` accumulator for the rare larger `n` (only hit by huge custom caps).
+#[inline]
 fn binom(n: u64, k: u64) -> u64 {
     if k > n {
         return 0;
+    }
+    if (n as usize) < PASCAL_N {
+        return pascal()[n as usize * PASCAL_N + k as usize];
     }
     let k = k.min(n - k);
     let mut num: u128 = 1;
@@ -137,20 +170,35 @@ fn num_layouts(cap: u64, m: u64) -> u64 {
 }
 
 /// Dense rank of a pit layout (composition) among all layouts with total ≤ cap.
+///
+/// Hot path: this runs at every endgame-frontier leaf of an exact search, so it
+/// reads the Pascal table directly (one O(1) row lookup per term) rather than
+/// going through `comps`/`binom`.
 fn rank(pits: &[u8]) -> u64 {
+    let p = pascal();
     let m = pits.len() as u64;
     let total: u64 = pits.iter().map(|&x| x as u64).sum();
     let mut r = offset(total, m);
     let mut rem = total;
     for (j, &c) in pits.iter().enumerate() {
         let parts_left = m - 1 - j as u64; // parts after position j
-        for v in 0..c as u64 {
-            r += comps(rem - v, parts_left);
-        }
-        rem -= c as u64;
         if parts_left == 0 {
             break;
         }
+        // Sum over v in 0..c of comps(rem - v, parts_left)
+        //   = C(rem - v + parts_left - 1, parts_left - 1).
+        // `parts_left >= 1` here, so the binomial column is fixed at
+        // `parts_left - 1` and we only need the table when n < PASCAL_N.
+        let col = (parts_left - 1) as usize;
+        for v in 0..c as u64 {
+            let n = (rem - v + parts_left - 1) as usize;
+            r += if n < PASCAL_N {
+                p[n * PASCAL_N + col]
+            } else {
+                comps(rem - v, parts_left)
+            };
+        }
+        rem -= c as u64;
     }
     r
 }

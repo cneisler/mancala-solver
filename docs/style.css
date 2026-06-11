@@ -33,6 +33,16 @@ button {
 }
 button:disabled { opacity: 0.45; cursor: default; }
 button.secondary { background: var(--pit); color: var(--text); }
+#stop { background: #e06c75; color: #2a0a0d; }
+
+/* "Analyzing…" indicator with a small spinner. */
+.working { display: flex; align-items: center; gap: 10px; color: var(--muted); margin: 0; }
+.spin {
+  width: 14px; height: 14px; border-radius: 50%;
+  border: 2px solid var(--pit); border-top-color: var(--accent);
+  display: inline-block; animation: spin 0.7s linear infinite;
+}
+@keyframes spin { to { transform: rotate(360deg); } }
 
 /* Board: two rows of pits, stores on the ends. */
 .board {

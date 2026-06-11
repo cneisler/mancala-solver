@@ -45,7 +45,9 @@ dependencies.
 The engine also compiles to **WebAssembly**, so it runs entirely client-side —
 an interactive board where you play moves and the solver shows the exact result,
 best move, per-move table, and principal variation. Everything in [`docs/`](docs/)
-is a static site (HTML/CSS/JS + a ~78 KB `mancala.wasm`).
+is a static site (HTML/CSS/JS + a ~90 KB `mancala.wasm`). The analysis runs in a
+**Web Worker** so a long search never freezes the page — the board stays
+responsive and a **Stop** button abandons a search in progress.
 
 Try it locally:
 
@@ -61,13 +63,16 @@ deployment → Source: Deploy from a branch*, then pick your branch and the
 prebuilt wasm is committed; rerun `docs/build.sh` to refresh it after engine
 changes.
 
-In the browser the solver uses the in-memory search with a node **budget**
-(selectable). A small **6-pit endgame tablebase** (`docs/kalah6.bin`, ~5 MB,
-≤ 12 seeds in play) ships with the page and is loaded on startup, so 6-pit
-endgames are solved **exactly and instantly** and mid-game positions resolve
-exactly far more often. Positions still too big for the budget (e.g. Kalah(6,4)
-straight from the opening) fall back to a clearly-labelled heuristic estimate —
-the high-cap tablebases that would solve those aren't shipped to the browser.
+In the browser the solver uses the in-memory search with a selectable **effort**
+(node budget: 2M / 20M / 80M). A small **6-pit endgame tablebase**
+(`docs/kalah6.bin`, ~5 MB, ≤ 12 seeds in play) ships with the page and is loaded
+on startup, so 6-pit endgames are solved **exactly and instantly** and mid-game
+positions resolve exactly far more often. Positions still too big for the budget
+(e.g. Kalah(6,4) straight from the opening) fall back to a clearly-labelled
+heuristic estimate — the high-cap tablebases that would solve those aren't
+shipped to the browser. The browser transposition table is memory-capped (the
+dense table tops out at 256 MB), so a deep search slows down rather than
+crashing the tab — the earlier out-of-memory at the highest effort is fixed.
 Rebuild the bundled table with
 `mancala-solver gen-tb --pits 6 --seeds-cap 12 --out docs/kalah6.bin`.
 
@@ -154,17 +159,23 @@ on a 4-core machine:
 | Kalah(5,3) | win by 6 | ~1 s |
 | Kalah(5,4) | win by 10 | ~7 s |
 | Kalah(6,3) | win by 2 | ~4 s |
-| **Kalah(6,4)** | **win by 8** (best opening: pit 2) | **~6 min** (cap-17 tablebase: ~100 s build, ~99 MB) |
+| **Kalah(6,4)** | **win by 8** (best opening: pit 2) | **~3 min** (cap-17 tablebase: ~100 s build, ~99 MB) |
 
 The classic **Kalah(6,4)** is solvable: it's a first-player win by 8 seeds, with
 the optimal opening being pit 2 (the move that scores into the store for a free
 turn). It needs a larger tablebase than the default cap (e.g.
 `--seeds-cap 17`) and a raised `--budget`.
 
+The transposition table is a custom dense open-addressing table (one `u128`
+per slot, packing the position key and value) that grows with the search and
+is `madvise`d for transparent huge pages. It caches far more positions per
+gigabyte than a general-purpose hash map, which is what makes a full Kalah(6,4)
+solve fit in memory while dropping fewer positions.
+
 For positions still too large to finish within the node budget, the solver
 automatically falls back to a depth-limited **heuristic** search, clearly
 labelled in the output. Memory stays bounded throughout (the transposition
-table is capped — it will not exhaust RAM).
+table grows only up to a fixed cap — it will not exhaust RAM).
 
 The move-evaluation table reports an **exact** value for the best move; clearly
 inferior moves are shown as a bound (e.g. `≤ +2 seeds`) because the solver
@@ -206,6 +217,46 @@ mancala-solver start --pits 6 --seeds 4 --tb kalah6.tb --budget 100000000000
 Higher caps cover more of the search tree (faster solves of hard boards like
 Kalah(6,4)) at the cost of a larger one-time build and file.
 
+## Opening book
+
+The endgame tablebase cuts the search off at the **bottom** (few seeds left); an
+opening book cuts it off at the **top** (the first few plies). Unlike the
+endgame — whose ≤cap positions are a small closed set — an early position's exact
+value depends on the whole tree beneath it, so a *proven* book can't make the
+**first** solve faster. It is a cheap **byproduct** of solving once: the layouts
+reachable within a few plies of the opening are solved together with one warm
+transposition table, and the result makes the opening / early game an **O(1)
+exact lookup** afterward. Entries are mirror-canonical and store-independent,
+exactly like the tablebase.
+
+```sh
+# Build (needs an endgame tablebase) and then use it: the opening is now instant.
+mancala-solver gen-book --pits 6 --seeds 4 --plies 2 --tb kalah6.tb --out kalah6_book.bin
+mancala-solver start --pits 6 --seeds 4 --book kalah6_book.bin --tb kalah6.tb
+```
+
+This is what lets the **web UI** show the exact "win by 8, best pit 2" for the
+opening instantly, instead of the heuristic estimate it would otherwise fall back
+to (the browser ships only a small endgame table).
+
+## Measuring playing strength
+
+For positions too large to solve exactly, strength only shows up over many
+games. The `playtest` command pits two engine configurations against each other
+over a diverse opening book (each opening played from both sides so colour bias
+cancels) and reports the score, the **Elo difference with a 95% confidence
+interval**, and the likelihood one side is stronger — the way engine changes are
+normally graded:
+
+```sh
+# Does searching deeper actually play better? (it does)
+mancala-solver playtest --a h:8 --b h:6 --games 1000 --threads 8
+```
+
+Engine specs are `h:<depth>` (depth-limited heuristic) or `a:<budget>:<depth>`
+(exact within a node budget, else heuristic). A symmetric matchup (`--a h:6 --b
+h:6`) scores exactly 50% / 0 Elo, confirming the harness is unbiased.
+
 ## Project layout
 
 The engine is a UI-independent library (`mancala`) so a future GUI/web front-end
@@ -217,9 +268,14 @@ can reuse it:
   position analysis.
 - `src/endgame.rs` — lazily-built, store-independent in-memory endgame table.
 - `src/tablebase.rs` — offline endgame tablebase: parallel build, save, load, lookup.
+- `src/book.rs` — proven opening book: build (warm-TT solves), lookup, exact
+  early-game analysis, save/load.
 - `src/hash.rs` — fast `u128`-key hasher shared by the TT and endgame tables.
 - `src/notation.rs` — board-notation parsing/formatting.
-- `src/main.rs` — the `mancala-solver` CLI (`analyze`, `start`, `gen-tb`).
+- `src/playtest.rs` — self-play strength testing: opening book, match runner,
+  Elo / confidence-interval / likelihood-of-superiority statistics.
+- `src/main.rs` — the `mancala-solver` CLI (`analyze`, `start`, `gen-tb`,
+  `gen-book`, `playtest`).
 
 ## Tests
 

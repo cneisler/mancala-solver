@@ -10,6 +10,7 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use mancala::board::{Board, Player, Rules};
+use mancala::book::Book;
 use mancala::notation;
 use mancala::solver::{analyze_with_tb, Analysis, MoveEval, Outcome};
 use mancala::tablebase::Tablebase;
@@ -50,6 +51,8 @@ fn run(args: &[String]) -> Result<(), String> {
         Some("analyze") => cmd_analyze(&args[1..]),
         Some("start") => cmd_start(&args[1..]),
         Some("gen-tb") => cmd_gen_tb(&args[1..]),
+        Some("gen-book") => cmd_gen_book(&args[1..]),
+        Some("playtest") => cmd_playtest(&args[1..]),
         Some(other) => Err(format!("unknown command '{other}'")),
     }
 }
@@ -66,6 +69,8 @@ struct CommonOpts {
     no_tb: bool,
     /// Override the auto-tablebase seed cap.
     seeds_cap: Option<u32>,
+    /// Optional opening book file (exact early-game lookups).
+    book_path: Option<String>,
 }
 
 impl Default for CommonOpts {
@@ -78,6 +83,7 @@ impl Default for CommonOpts {
             tb_path: None,
             no_tb: false,
             seeds_cap: None,
+            book_path: None,
         }
     }
 }
@@ -115,6 +121,10 @@ fn parse_common(flag: &str, iter: &mut std::slice::Iter<'_, String>, opts: &mut 
         }
         "--tb" => {
             opts.tb_path = Some(take_value(flag, iter)?.to_string());
+            Ok(true)
+        }
+        "--book" => {
+            opts.book_path = Some(take_value(flag, iter)?.to_string());
             Ok(true)
         }
         "--no-tb" => {
@@ -244,9 +254,35 @@ fn report(board: &Board, opts: &CommonOpts) -> Result<(), String> {
     // Resolve the endgame tablebase: explicit `--tb`, the automatic cached one,
     // or none.
     let tb = resolve_tablebase(board, opts)?;
-    println!();
 
-    let analysis = analyze_with_tb(board, opts.rules, opts.budget, opts.fallback_depth, tb.as_ref());
+    // Consult an opening book first: if the position is in it, the exact result
+    // is an instant lookup (no search).
+    let analysis = if let Some(path) = &opts.book_path {
+        let book = Book::load(Path::new(path))
+            .map_err(|e| format!("failed to load book '{path}': {e}"))?;
+        if book.pits_per_side() != board.pits_per_side() {
+            return Err(format!(
+                "book is for {}-pit boards, but this board has {} pits per side",
+                book.pits_per_side(),
+                board.pits_per_side()
+            ));
+        }
+        match book.analyze(board, opts.rules, tb.as_ref()) {
+            Some(a) => {
+                println!("Opening book: {path} (position found — exact lookup)");
+                println!();
+                a
+            }
+            None => {
+                println!("Opening book: {path} (position not in book — searching)");
+                println!();
+                analyze_with_tb(board, opts.rules, opts.budget, opts.fallback_depth, tb.as_ref())
+            }
+        }
+    } else {
+        println!();
+        analyze_with_tb(board, opts.rules, opts.budget, opts.fallback_depth, tb.as_ref())
+    };
     println!("{}", render_analysis(board, &analysis));
     Ok(())
 }
@@ -378,6 +414,182 @@ fn cmd_gen_tb(args: &[String]) -> Result<(), String> {
     tb.save(Path::new(&out))
         .map_err(|e| format!("failed to write '{out}': {e}"))?;
     println!("Wrote {out}");
+    Ok(())
+}
+
+fn cmd_gen_book(args: &[String]) -> Result<(), String> {
+    let mut pits: usize = 6;
+    let mut seeds: u8 = 4;
+    let mut plies: u32 = 2;
+    let mut tb_path: Option<String> = None;
+    let mut out: Option<String> = None;
+    let mut rules = Rules::default();
+
+    let mut iter = args.iter();
+    while let Some(arg) = iter.next() {
+        match arg.as_str() {
+            "--pits" => {
+                pits = take_value(arg, &mut iter)?
+                    .parse()
+                    .map_err(|_| "--pits must be a positive integer".to_string())?
+            }
+            "--seeds" => {
+                seeds = take_value(arg, &mut iter)?
+                    .parse()
+                    .map_err(|_| "--seeds must be 0..=255".to_string())?
+            }
+            "--plies" => {
+                plies = take_value(arg, &mut iter)?
+                    .parse()
+                    .map_err(|_| "--plies must be a non-negative integer".to_string())?
+            }
+            "--tb" => tb_path = Some(take_value(arg, &mut iter)?.to_string()),
+            "--out" | "-o" => out = Some(take_value(arg, &mut iter)?.to_string()),
+            "--capture-empty" => rules.capture_requires_nonempty_opposite = false,
+            other => return Err(format!("unknown flag '{other}' for 'gen-book'")),
+        }
+    }
+
+    let out = out.ok_or("gen-book requires --out <file>")?;
+    let tb_path = tb_path.ok_or("gen-book requires --tb <file> (an endgame tablebase)")?;
+    let tb = Tablebase::load(Path::new(&tb_path))
+        .map_err(|e| format!("failed to load tablebase '{tb_path}': {e}"))?;
+    if tb.pits_per_side() != pits {
+        return Err(format!(
+            "tablebase is for {}-pit boards, but --pits {pits}",
+            tb.pits_per_side()
+        ));
+    }
+
+    println!("Building opening book: pits={pits} seeds={seeds} plies={plies} (tablebase cap {})...", tb.cap());
+    let mut last = usize::MAX;
+    let book = Book::build(rules, pits, seeds, plies, &tb, |done, total| {
+        if done != last {
+            last = done;
+            eprint!("\r  solving layouts… {done}/{total}");
+        }
+    })?;
+    eprintln!("\r  solved {} layouts.            ", book.len());
+    book.save(Path::new(&out))
+        .map_err(|e| format!("failed to write '{out}': {e}"))?;
+    println!("Wrote {out} ({} positions)", book.len());
+    Ok(())
+}
+
+fn cmd_playtest(args: &[String]) -> Result<(), String> {
+    use mancala::playtest::{run_match, Engine, MatchConfig};
+
+    let mut a_spec = "h:8".to_string();
+    let mut b_spec = "h:6".to_string();
+    let mut pits: usize = 6;
+    let mut seeds: u8 = 4;
+    let mut games: usize = 1000;
+    let mut opening_plies: u32 = 4;
+    let mut seed: u64 = 1;
+    let mut rules = Rules::default();
+    let mut tb_path: Option<String> = None;
+    let mut threads: usize = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1);
+
+    let mut iter = args.iter();
+    while let Some(arg) = iter.next() {
+        match arg.as_str() {
+            "--a" => a_spec = take_value(arg, &mut iter)?.to_string(),
+            "--b" => b_spec = take_value(arg, &mut iter)?.to_string(),
+            "--pits" => {
+                pits = take_value(arg, &mut iter)?
+                    .parse()
+                    .map_err(|_| "--pits must be a positive integer".to_string())?
+            }
+            "--seeds" => {
+                seeds = take_value(arg, &mut iter)?
+                    .parse()
+                    .map_err(|_| "--seeds must be 0..=255".to_string())?
+            }
+            "--games" => {
+                games = take_value(arg, &mut iter)?
+                    .parse()
+                    .map_err(|_| "--games must be a positive integer".to_string())?
+            }
+            "--opening-plies" => {
+                opening_plies = take_value(arg, &mut iter)?
+                    .parse()
+                    .map_err(|_| "--opening-plies must be a non-negative integer".to_string())?
+            }
+            "--seed" => {
+                seed = take_value(arg, &mut iter)?
+                    .parse()
+                    .map_err(|_| "--seed must be a non-negative integer".to_string())?
+            }
+            "--threads" => {
+                threads = take_value(arg, &mut iter)?
+                    .parse()
+                    .map_err(|_| "--threads must be a positive integer".to_string())?
+            }
+            "--tb" => tb_path = Some(take_value(arg, &mut iter)?.to_string()),
+            "--capture-empty" => rules.capture_requires_nonempty_opposite = false,
+            other => return Err(format!("unknown flag '{other}' for 'playtest'")),
+        }
+    }
+
+    let a = Engine::parse(&a_spec)?;
+    let b = Engine::parse(&b_spec)?;
+    // Each opening is played from both sides, so two games per opening.
+    let openings = games.div_ceil(2).max(1);
+
+    let tb = match &tb_path {
+        Some(p) => {
+            let t = Tablebase::load(Path::new(p)).map_err(|e| format!("failed to load tablebase '{p}': {e}"))?;
+            if t.pits_per_side() != pits {
+                return Err(format!(
+                    "tablebase is for {}-pit boards, but --pits {pits}",
+                    t.pits_per_side()
+                ));
+            }
+            Some(t)
+        }
+        None => None,
+    };
+
+    let cfg = MatchConfig {
+        pits,
+        seeds,
+        rules,
+        openings,
+        opening_plies,
+        seed,
+        threads,
+    };
+
+    println!("Playtest  A = {a_spec}   B = {b_spec}");
+    println!(
+        "Board {pits}×{seeds}, {} games ({openings} openings × 2 sides), {opening_plies} random opening plies, seed {seed}, {threads} thread(s)",
+        openings * 2
+    );
+    println!();
+
+    let total = openings * 2;
+    let mut last_pct = usize::MAX;
+    let res = run_match(a, b, &cfg, tb.as_ref(), |done, tot| {
+        let pct = done * 100 / tot.max(1);
+        if pct != last_pct && pct % 5 == 0 {
+            last_pct = pct;
+            eprint!("\r  playing… {pct:3}% ({done}/{tot})");
+        }
+    })?;
+    eprintln!("\r  done.                                ");
+
+    let n = res.games();
+    let (lo, hi) = res.elo_ci();
+    let elo = res.elo();
+    println!("Result (from A's perspective):");
+    println!(
+        "  W {}  L {}  D {}   ({} games)",
+        res.wins, res.losses, res.draws, n
+    );
+    println!("  Score: {:.1}%", res.score() * 100.0);
+    println!("  Elo (A − B): {:+.1}  [95% CI {:+.0} … {:+.0}]", elo, lo, hi);
+    println!("  LOS (A stronger than B): {:.1}%", res.los() * 100.0);
+    let _ = total;
     Ok(())
 }
 
@@ -554,6 +766,8 @@ COMMANDS:
     analyze   Analyze a position given in board notation
     start     Analyze the standard opening for a given board size
     gen-tb    Build an offline endgame tablebase and write it to disk
+    gen-book  Build a proven opening book (early-game exact lookups)
+    playtest  Play two engine configs against each other and report Elo
     help      Show this help
 
 ANALYZE:
@@ -579,6 +793,24 @@ GEN-TB:
     Precomputes exact endgame values for every pit layout with up to
     <seeds-cap> seeds in play, writing a tablebase file. Pass it to analyze/start
     with --tb to make those endgame positions O(1) lookups.
+
+GEN-BOOK:
+    mancala-solver gen-book --pits 6 --seeds 4 --plies 2 --tb kalah6.tb --out kalah6_book.bin
+
+    Solves every layout reachable within <plies> moves of the opening (reusing
+    one warm table) and writes a proven opening book. Pass it to analyze/start
+    with --book to make those early positions instant exact lookups.
+
+PLAYTEST:
+    mancala-solver playtest --a h:8 --b h:6 [--games 1000] [OPTIONS]
+
+    Plays engine A against engine B over a diverse opening book (each opening
+    from both sides) and reports the score, the Elo difference with a 95%
+    confidence interval, and the likelihood A is stronger. Engine specs:
+        h:<depth>             depth-limited heuristic search
+        a:<budget>:<depth>    exact within <budget> nodes, else heuristic
+    Options: --pits N --seeds S --games N --opening-plies K --seed X
+             --threads N --tb <file> --capture-empty
 
 OPTIONS (analyze & start):
     --turn <0|1>        Side to move (0 = P0/South, 1 = P1/North). Default: 0

@@ -1,22 +1,10 @@
-// Mancala Solver — browser front-end. Loads the Rust engine compiled to wasm and
-// drives an interactive Kalah board. All computation is client-side.
+// Mancala Solver — browser front-end. The Rust engine is compiled to wasm and
+// runs entirely client-side. Instant operations (start a game, play a move,
+// replay the principal variation) use a wasm instance on the main thread; the
+// potentially long position analysis runs in a Web Worker (worker.js) so the
+// page never freezes, with a Stop button to abandon a search.
 
-let wasm = null;
-
-// Fetch the bundled 6-pit endgame tablebase and hand it to the engine. Returns
-// true on success. It only applies to 6-pit boards; other sizes ignore it.
-async function loadTb() {
-  try {
-    const bytes = new Uint8Array(await (await fetch("kalah6.bin")).arrayBuffer());
-    const ptr = wasm.wasm_alloc(bytes.length);
-    new Uint8Array(wasm.memory.buffer, ptr, bytes.length).set(bytes);
-    const ok = wasm.wasm_set_tb(ptr, bytes.length);
-    wasm.wasm_dealloc(ptr, bytes.length);
-    return ok === 1;
-  } catch {
-    return false;
-  }
-}
+let wasm = null; // main-thread instance: start / apply only (no tablebase needed)
 
 async function loadWasm() {
   // Prefer streaming; fall back to ArrayBuffer if the host serves the wasm with
@@ -56,12 +44,59 @@ const engine = {
   start: (pits, seeds, turn) => readResult(wasm.wasm_start(pits, seeds, turn)),
   apply: (notation, turn, mv, capEmpty) =>
     callBoard(wasm.wasm_apply, notation, turn, mv, capEmpty),
-  analyze: (notation, turn, budget, depth, capEmpty) =>
-    callBoard(wasm.wasm_analyze, notation, turn, budget, depth, capEmpty),
 };
 
+// --- analysis worker ---------------------------------------------------------
+// The worker owns its own wasm instance plus the endgame tablebase and answers
+// `analyze` requests. We recreate it after a Stop (a wasm search cannot be
+// interrupted mid-flight, so abandoning one means discarding the worker).
+let worker = null;
+let workerReady = false;
+let pending = null; // { resolve, reject } for the in-flight analysis
+
+function spawnWorker(onReady) {
+  worker = new Worker("worker.js");
+  worker.onmessage = (e) => {
+    const m = e.data;
+    if (m.type === "ready") {
+      workerReady = true;
+      if (onReady) onReady(m);
+    } else if (m.type === "result" && pending) {
+      const p = pending;
+      pending = null;
+      if (m.error) p.reject(new Error(m.error));
+      else p.resolve(m.data);
+    }
+  };
+  worker.onerror = (e) => {
+    // A wasm trap (e.g. out of memory) surfaces here; reject and rebuild.
+    if (pending) {
+      pending.reject(new Error(e.message || "analysis crashed"));
+      pending = null;
+    }
+    restartWorker();
+  };
+}
+
+function restartWorker() {
+  if (worker) worker.terminate();
+  workerReady = false;
+  spawnWorker(() => {});
+}
+
+function analyzeAsync(notation, turn, budget, depth, capEmpty) {
+  return new Promise((resolve, reject) => {
+    if (!worker || !workerReady) {
+      reject(new Error("engine still loading"));
+      return;
+    }
+    pending = { resolve, reject };
+    worker.postMessage({ type: "analyze", notation, turn, budget, depth, capEmpty });
+  });
+}
+
 // --- game state --------------------------------------------------------------
-const state = { notation: "", turn: 0, pits: 6, history: [], lastAnalysis: null };
+const state = { notation: "", turn: 0, pits: 6, history: [], lastAnalysis: null, busy: false };
 
 function parseNotation(s) {
   const [p0, p1] = s.split("|").map((g) => g.trim().split(",").map(Number));
@@ -89,7 +124,7 @@ function render() {
       : -1;
 
   const pit = (side, idx, seeds) => {
-    const playable = side === state.turn && seeds > 0;
+    const playable = side === state.turn && seeds > 0 && !state.busy;
     const cls = ["pit"];
     if (playable) cls.push("playable");
     if (side === state.turn && idx === best) cls.push("best");
@@ -122,11 +157,21 @@ function render() {
 
   document.getElementById("turnLabel").textContent =
     `${state.turn === 0 ? "P0 (South)" : "P1 (North)"} to move`;
-  document.getElementById("undo").disabled = state.history.length === 0;
-  document.getElementById("playBest").disabled = false;
+  updateControls();
+}
+
+// Enable/disable controls for the current state (disabled while analyzing).
+function updateControls() {
+  const busy = state.busy;
+  document.getElementById("undo").disabled = busy || state.history.length === 0;
+  document.getElementById("playBest").disabled = busy || !workerReady;
+  document.getElementById("analyze").disabled = busy || !workerReady;
+  document.getElementById("newGame").disabled = busy;
+  document.getElementById("stop").hidden = !busy;
 }
 
 function playMove(mv) {
+  if (state.busy) return;
   const r = engine.apply(state.notation, state.turn, mv, capEmpty());
   if (r.error) {
     showError(r.error);
@@ -145,10 +190,6 @@ function playMove(mv) {
 }
 
 // --- analysis ----------------------------------------------------------------
-function lots(pits) {
-  return pits.map((p) => p + 1);
-}
-
 // Build a readable principal-variation string by walking the moves.
 function formatPv(pv) {
   let cur = state.notation, turn = state.turn;
@@ -166,20 +207,62 @@ function formatPv(pv) {
   return parts.join("  →  ");
 }
 
-function analyze() {
-  const budget = Number(document.getElementById("budget").value);
-  const a = engine.analyze(state.notation, state.turn, budget, 11, capEmpty());
-  if (a.error) {
-    showError(a.error);
+let elapsedTimer = null;
+
+function startBusy(label) {
+  state.busy = true;
+  updateControls();
+  render(); // pits become non-playable
+  const t0 = performance.now();
+  const res = document.getElementById("result");
+  res.className = "result";
+  const tick = () => {
+    const s = ((performance.now() - t0) / 1000).toFixed(1);
+    res.innerHTML = `<p class="working">Analyzing (${label})… ${s}s <span class="spin"></span></p>`;
+  };
+  tick();
+  elapsedTimer = setInterval(tick, 100);
+}
+
+function endBusy() {
+  state.busy = false;
+  if (elapsedTimer) {
+    clearInterval(elapsedTimer);
+    elapsedTimer = null;
+  }
+  updateControls();
+}
+
+async function analyze() {
+  if (state.busy) return null;
+  const sel = document.getElementById("budget");
+  const budget = Number(sel.value);
+  const label = sel.options[sel.selectedIndex].text.split("—")[0].trim();
+  const notation = state.notation, turn = state.turn;
+  startBusy(label);
+  try {
+    const a = await analyzeAsync(notation, turn, budget, 11, capEmpty());
+    endBusy();
+    if (a.error) {
+      showError(a.error);
+      return null;
+    }
+    state.lastAnalysis = {
+      data: a,
+      matches: (n, t) => n === notation && t === turn,
+    };
+    // Only render if the position hasn't changed under us.
+    if (notation === state.notation && turn === state.turn) {
+      renderAnalysis(a);
+      render(); // re-render to highlight the best pit
+    }
+    return a;
+  } catch (e) {
+    endBusy();
+    render();
+    showError(`analysis failed (${e.message}). Try a smaller effort setting.`);
     return null;
   }
-  state.lastAnalysis = {
-    data: a,
-    matches: (n, t) => n === state.notation && t === state.turn,
-  };
-  renderAnalysis(a);
-  render(); // re-render to highlight the best pit
-  return a;
 }
 
 function renderAnalysis(a) {
@@ -192,7 +275,7 @@ function renderAnalysis(a) {
   } else if (a.exact) {
     verdict = `${who}: ${a.outcome} — perfect play ends ${a.value >= 0 ? "+" : ""}${a.value} seeds`;
   } else {
-    verdict = `${who}: best guess ${a.outcome} (heuristic, depth ${a.depth}; not proven)`;
+    verdict = `${who}: best guess ${a.outcome} (heuristic, depth ${a.depth}; not proven — raise Effort to try for an exact result)`;
   }
 
   let html = `<p class="verdict">${verdict}</p>`;
@@ -215,11 +298,23 @@ function renderAnalysis(a) {
   res.innerHTML = html;
 }
 
-function playBest() {
-  const a = state.lastAnalysis && state.lastAnalysis.matches(state.notation, state.turn)
+async function playBest() {
+  let a = state.lastAnalysis && state.lastAnalysis.matches(state.notation, state.turn)
     ? state.lastAnalysis.data
-    : analyze();
+    : await analyze();
   if (a && a.best >= 0) playMove(a.best);
+}
+
+function stop() {
+  if (!state.busy) return;
+  restartWorker();
+  if (pending) {
+    pending.reject(new Error("stopped"));
+    pending = null;
+  }
+  endBusy();
+  render();
+  document.getElementById("result").innerHTML = `<p>Analysis stopped.</p>`;
 }
 
 function showError(msg) {
@@ -228,6 +323,7 @@ function showError(msg) {
 
 // --- new game / undo ---------------------------------------------------------
 function newGame() {
+  if (state.busy) return;
   const pits = Math.max(1, Math.min(9, Number(document.getElementById("pits").value)));
   const seeds = Math.max(0, Math.min(20, Number(document.getElementById("seeds").value)));
   const r = engine.start(pits, seeds, 0);
@@ -245,6 +341,7 @@ function newGame() {
 }
 
 function undo() {
+  if (state.busy) return;
   const prev = state.history.pop();
   if (!prev) return;
   state.notation = prev.notation;
@@ -258,14 +355,20 @@ function undo() {
 (async function () {
   try {
     await loadWasm();
-    const tbOk = await loadTb();
-    document.getElementById("status").textContent = tbOk
-      ? "engine ready · 6-pit endgame tablebase loaded (≤12 seeds solved instantly)"
-      : "engine ready";
+    const status = document.getElementById("status");
+    status.textContent = "loading tablebase…";
+    spawnWorker((m) => {
+      const bits = [];
+      if (m.tb) bits.push("6-pit endgame tablebase (≤12 seeds instant)");
+      if (m.book) bits.push("6×4 opening book (early game exact & instant)");
+      status.textContent = bits.length ? `engine ready · ${bits.join(" · ")}` : "engine ready";
+      updateControls(); // enable Analyze now that the worker can answer
+    });
     document.getElementById("newGame").onclick = newGame;
     document.getElementById("undo").onclick = undo;
     document.getElementById("analyze").onclick = analyze;
     document.getElementById("playBest").onclick = playBest;
+    document.getElementById("stop").onclick = stop;
     newGame();
   } catch (e) {
     document.getElementById("status").innerHTML = `<span class="err">failed to load engine: ${e}</span>`;
