@@ -361,8 +361,6 @@ struct Searcher<'a> {
     /// When true, the depth-limited search runs a quiescence search at the
     /// horizon (extending forcing moves) instead of evaluating immediately.
     quiesce: bool,
-    /// When true, late quiet moves are searched at reduced depth (LMR).
-    lmr: bool,
     nodes: u64,
     budget: u64,
     /// Optional wall-clock deadline (for time-controlled play); checked
@@ -386,7 +384,6 @@ impl<'a> Searcher<'a> {
             endgame: Endgame::new(rules, endgame_cutoff),
             tb,
             quiesce: false,
-            lmr: false,
             nodes: 0,
             budget,
             deadline: None,
@@ -718,25 +715,11 @@ impl<'a> Searcher<'a> {
             } else if idx == 0 {
                 -self.search(&r.board, -beta, -alpha, child_depth)
             } else {
-                // Late move reduction (play mode only — unsound, so gated to
-                // depth-limited search, never the exact prover): try late, quiet
-                // moves at reduced depth; only re-search at full depth the ones
-                // that beat alpha. The well-ordered early/forcing moves and
-                // captures are searched at full depth.
-                let reduced = if self.lmr && matches!(depth, Some(d) if d >= 3) && idx >= 3 && !r.captured {
-                    child_depth.map(|d| d.saturating_sub(1))
-                } else {
-                    child_depth
-                };
-                let mut v = -self.search(&r.board, -alpha - 1, -alpha, reduced);
-                if v > alpha && reduced != child_depth {
-                    // A reduced move beat alpha — verify it at full depth.
-                    v = -self.search(&r.board, -alpha - 1, -alpha, child_depth);
-                }
-                if v > alpha && v < beta {
+                let probe = -self.search(&r.board, -alpha - 1, -alpha, child_depth);
+                if probe > alpha && probe < beta {
                     -self.search(&r.board, -beta, -alpha, child_depth)
                 } else {
-                    v
+                    probe
                 }
             };
 
@@ -1003,7 +986,6 @@ pub fn play_search(
     limit: Limit,
     use_endgame: bool,
     quiesce: bool,
-    lmr: bool,
 ) -> Analysis {
     let tb = if use_endgame {
         tb.filter(|t| t.pits_per_side() == board.pits_per_side())
@@ -1021,7 +1003,6 @@ pub fn play_search(
     };
     let mut s = Searcher::new(rules, budget, endgame_cutoff, tb, 1 << 24);
     s.quiesce = quiesce;
-    s.lmr = lmr;
     if let Limit::Time(ms) = limit {
         s.deadline = Some(Instant::now() + std::time::Duration::from_millis(ms));
     }

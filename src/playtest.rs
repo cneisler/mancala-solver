@@ -27,8 +27,8 @@ pub enum Engine {
     /// Plain heuristic search (no endgame oracle, no quiescence) — the baseline.
     Heuristic { limit: Limit },
     /// Tablebase/endgame-aware play (perfect endgame); `quiesce` extends forcing
-    /// moves at the horizon; `lmr` reduces late quiet moves.
-    Play { limit: Limit, quiesce: bool, lmr: bool },
+    /// moves at the horizon.
+    Play { limit: Limit, quiesce: bool },
     /// Try an exact solve within `budget` nodes; else a depth-`depth` heuristic.
     Analyze { budget: u64, depth: u32 },
 }
@@ -40,8 +40,8 @@ impl Engine {
             return None;
         }
         let a = match *self {
-            Engine::Heuristic { limit } => solver::play_search(b, rules, tb, limit, false, false, false),
-            Engine::Play { limit, quiesce, lmr } => solver::play_search(b, rules, tb, limit, true, quiesce, lmr),
+            Engine::Heuristic { limit } => solver::play_search(b, rules, tb, limit, false, false),
+            Engine::Play { limit, quiesce } => solver::play_search(b, rules, tb, limit, true, quiesce),
             Engine::Analyze { budget, depth } => solver::analyze_with_tb(b, rules, budget, depth, tb),
         };
         a.best_move
@@ -55,16 +55,15 @@ impl Engine {
         let parts: Vec<&str> = spec.split(':').collect();
         match parts.as_slice() {
             ["h", l] => Ok(Engine::Heuristic { limit: parse_limit(l, spec)? }),
-            ["p", l] => Ok(Engine::Play { limit: parse_limit(l, spec)?, quiesce: false, lmr: false }),
-            ["q", l] => Ok(Engine::Play { limit: parse_limit(l, spec)?, quiesce: true, lmr: false }),
-            ["r", l] => Ok(Engine::Play { limit: parse_limit(l, spec)?, quiesce: true, lmr: true }),
+            ["p", l] => Ok(Engine::Play { limit: parse_limit(l, spec)?, quiesce: false }),
+            ["q", l] => Ok(Engine::Play { limit: parse_limit(l, spec)?, quiesce: true }),
             ["a", b, d] => Ok(Engine::Analyze {
                 budget: b.parse().map_err(|_| format!("bad budget in '{spec}'"))?,
                 depth: d.parse().map_err(|_| format!("bad depth in '{spec}'"))?,
             }),
             _ => Err(format!(
-                "bad engine spec '{spec}' (h/p/q/r:<lim> or a:<budget>:<depth>; r = q + late-move \
-                 reductions; <lim> = depth '6', nodes 'n200000', or time 't50')"
+                "bad engine spec '{spec}' (use 'h:<lim>', 'p:<lim>', 'q:<lim>', or 'a:<budget>:<depth>'; \
+                 <lim> is a depth like '6'/'d6' or a node budget like 'n200000')"
             )),
         }
     }
