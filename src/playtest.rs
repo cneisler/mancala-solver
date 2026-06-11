@@ -27,8 +27,9 @@ pub enum Engine {
     /// Plain heuristic search (no endgame oracle, no quiescence) — the baseline.
     Heuristic { limit: Limit },
     /// Tablebase/endgame-aware play (perfect endgame); `quiesce` extends forcing
-    /// moves at the horizon.
-    Play { limit: Limit, quiesce: bool },
+    /// moves at the horizon; `tt` enables the transposition table (toggle for
+    /// measuring its contribution).
+    Play { limit: Limit, quiesce: bool, tt: bool },
     /// Try an exact solve within `budget` nodes; else a depth-`depth` heuristic.
     Analyze { budget: u64, depth: u32 },
 }
@@ -40,8 +41,8 @@ impl Engine {
             return None;
         }
         let a = match *self {
-            Engine::Heuristic { limit } => solver::play_search(b, rules, tb, limit, false, false),
-            Engine::Play { limit, quiesce } => solver::play_search(b, rules, tb, limit, true, quiesce),
+            Engine::Heuristic { limit } => solver::play_search(b, rules, tb, limit, false, false, true),
+            Engine::Play { limit, quiesce, tt } => solver::play_search(b, rules, tb, limit, true, quiesce, tt),
             Engine::Analyze { budget, depth } => solver::analyze_with_tb(b, rules, budget, depth, tb),
         };
         a.best_move
@@ -55,15 +56,17 @@ impl Engine {
         let parts: Vec<&str> = spec.split(':').collect();
         match parts.as_slice() {
             ["h", l] => Ok(Engine::Heuristic { limit: parse_limit(l, spec)? }),
-            ["p", l] => Ok(Engine::Play { limit: parse_limit(l, spec)?, quiesce: false }),
-            ["q", l] => Ok(Engine::Play { limit: parse_limit(l, spec)?, quiesce: true }),
+            ["p", l] => Ok(Engine::Play { limit: parse_limit(l, spec)?, quiesce: false, tt: true }),
+            ["q", l] => Ok(Engine::Play { limit: parse_limit(l, spec)?, quiesce: true, tt: true }),
+            // `q:<lim>:nott` disables the transposition table (for A/B testing it).
+            ["q", l, "nott"] => Ok(Engine::Play { limit: parse_limit(l, spec)?, quiesce: true, tt: false }),
             ["a", b, d] => Ok(Engine::Analyze {
                 budget: b.parse().map_err(|_| format!("bad budget in '{spec}'"))?,
                 depth: d.parse().map_err(|_| format!("bad depth in '{spec}'"))?,
             }),
             _ => Err(format!(
-                "bad engine spec '{spec}' (use 'h:<lim>', 'p:<lim>', 'q:<lim>', or 'a:<budget>:<depth>'; \
-                 <lim> is a depth like '6'/'d6' or a node budget like 'n200000')"
+                "bad engine spec '{spec}' (h/p/q:<lim> or a:<budget>:<depth>; <lim> = depth '6', \
+                 nodes 'n200000', or time 't50'; 'q:<lim>:nott' disables the TT)"
             )),
         }
     }

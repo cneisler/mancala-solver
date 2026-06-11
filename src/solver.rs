@@ -111,6 +111,8 @@ struct TtProbe {
     value: i32,
     flag: Flag,
     best: Option<usize>,
+    /// Search depth the entry was computed to (play mode); 0 for exact entries.
+    depth: u8,
 }
 
 /// Number of bits used to encode a single cell in the packed key. Cells holding
@@ -119,8 +121,9 @@ const CELL_BITS: u32 = 6;
 
 /// Bits of payload packed into the low end of each `u128` slot alongside the
 /// board key (high bits): value (`i16`, 16 bits) + flag (2 bits) + best-move
-/// (4 bits). Keys needing more than `128 - PAYLOAD_BITS` bits are uncacheable.
-const PAYLOAD_BITS: u32 = 22;
+/// (4 bits) + search depth (6 bits, play mode only). Keys needing more than
+/// `128 - PAYLOAD_BITS` bits are uncacheable.
+const PAYLOAD_BITS: u32 = 28;
 const PAYLOAD_MASK: u128 = (1 << PAYLOAD_BITS) - 1;
 
 /// Maximum slots for the exact table (each is 16 B). On 64-bit hosts 2^28 slots
@@ -234,7 +237,7 @@ impl Tt {
     }
 
     #[inline]
-    fn encode(key: u128, value: i32, flag: Flag, best: Option<usize>) -> u128 {
+    fn encode(key: u128, value: i32, flag: Flag, best: Option<usize>, depth: u8) -> u128 {
         let v = (value.clamp(i16::MIN as i32, i16::MAX as i32) as i16) as u16 as u128;
         let f: u128 = match flag {
             Flag::Exact => 1,
@@ -242,7 +245,8 @@ impl Tt {
             Flag::Upper => 3,
         };
         let bm = best.map_or(15u128, |m| (m as u128) & 15);
-        (key << PAYLOAD_BITS) | v | (f << 16) | (bm << 18)
+        let d = (depth.min(63) as u128) << 22;
+        (key << PAYLOAD_BITS) | v | (f << 16) | (bm << 18) | d
     }
 
     #[inline]
@@ -259,6 +263,7 @@ impl Tt {
                 15 => None,
                 b => Some(b as usize),
             },
+            depth: ((payload >> 22) & 63) as u8,
         }
     }
 
@@ -294,12 +299,12 @@ impl Tt {
         None
     }
 
-    fn store(&mut self, key: u128, value: i32, flag: Flag, best: Option<usize>) {
+    fn store(&mut self, key: u128, value: i32, flag: Flag, best: Option<usize>, depth: u8) {
         if self.occupancy * 20 >= self.slots.len() * TT_GROW_NUM && self.slots.len() < self.max_slots
         {
             self.grow();
         }
-        let entry = Self::encode(key, value, flag, best);
+        let entry = Self::encode(key, value, flag, best, depth);
         let mut i = (tt_mix(key) as usize) & self.mask;
         for _ in 0..TT_MAX_PROBE {
             let e = self.slots[i];
@@ -361,6 +366,9 @@ struct Searcher<'a> {
     /// When true, the depth-limited search runs a quiescence search at the
     /// horizon (extending forcing moves) instead of evaluating immediately.
     quiesce: bool,
+    /// Whether the play (depth-limited) search uses the transposition table.
+    /// Always true in normal use; a toggle for measuring the TT's contribution.
+    play_tt: bool,
     nodes: u64,
     budget: u64,
     /// Optional wall-clock deadline (for time-controlled play); checked
@@ -384,6 +392,7 @@ impl<'a> Searcher<'a> {
             endgame: Endgame::new(rules, endgame_cutoff),
             tb,
             quiesce: false,
+            play_tt: true,
             nodes: 0,
             budget,
             deadline: None,
@@ -426,15 +435,21 @@ impl<'a> Searcher<'a> {
     /// Returns `None` when the packed key would not fit in a `u128` (only very
     /// large boards or extremely full pits).
     fn key(b: &Board, depth: Option<u32>) -> Option<u128> {
+        // Play mode (depth-limited): a 64-bit position hash always fits the slot,
+        // so every board size gets a transposition table — the lossless packed
+        // key overflows a u128 past ~7 pits. Mover-first (mirror-canonical) and
+        // store-dependent (the heuristic depends on the stores). Collisions are
+        // astronomically rare and at worst cost one suboptimal move — this is the
+        // player, not the prover, which keeps the exact packed key below.
+        if depth.is_some() {
+            return Some(Self::play_hash(b));
+        }
+
+        // Exact mode: a lossless, store-independent packed key (mover-first,
+        // CELL_BITS per pit, plus a depth marker), or `None` if it would not fit.
         let n = b.pits_per_side();
         let cells = b.cells();
-        let store_independent = depth.is_none();
-        let included = if store_independent { 2 * n } else { 2 * n + 2 };
-        // Bits: cells (CELL_BITS each) + 8 depth-marker bits. The key is packed
-        // into a slot as `(key << PAYLOAD_BITS) | payload`, so it must also leave
-        // room for the payload — otherwise the shift silently truncates the high
-        // bits and aliases distinct positions to the same key.
-        if included as u32 * CELL_BITS + 8 + PAYLOAD_BITS > 128 {
+        if (2 * n) as u32 * CELL_BITS + 8 + PAYLOAD_BITS > 128 {
             return None;
         }
         let mut packed: u128 = 0;
@@ -452,16 +467,25 @@ impl<'a> Searcher<'a> {
                     return None;
                 }
             }
-            if !store_independent && !push(b.store(p)) {
-                return None;
-            }
         }
-        let depth_marker: u128 = match depth {
-            None => 255,
-            Some(d) => d.min(254) as u128,
-        };
-        packed = (packed << 8) | depth_marker;
+        packed = (packed << 8) | 255; // exact depth marker
         Some(packed)
+    }
+
+    /// 64-bit FNV-1a hash of the position (mover-first cells + stores) for the
+    /// play-mode transposition table. Forced non-zero so it never equals the
+    /// empty-slot sentinel.
+    fn play_hash(b: &Board) -> u128 {
+        let n = b.pits_per_side();
+        let mover = b.turn();
+        let mut h = 0xcbf2_9ce4_8422_2325u64;
+        for p in [mover, mover.other()] {
+            for i in 0..n {
+                h = (h ^ b.cells()[b.pit_global(p, i)] as u64).wrapping_mul(0x0000_0100_0000_01b3);
+            }
+            h = (h ^ b.store(p) as u64).wrapping_mul(0x0000_0100_0000_01b3);
+        }
+        (h | 1) as u128
     }
 
     /// Generate legal moves for the side to move into `buf`, ordered to improve
@@ -664,21 +688,36 @@ impl<'a> Searcher<'a> {
             0
         };
 
-        let key = Self::key(b, depth);
+        // The exact search always keys the TT; the play search can be told not to
+        // (for measuring the table's contribution).
+        let key = if depth.is_none() || self.play_tt {
+            Self::key(b, depth)
+        } else {
+            None
+        };
         let alpha_orig = alpha;
         let mut tt_move = None;
         if let Some(k) = key {
             if let Some(e) = self.tt.get(k) {
-                let val = e.value + sd;
-                match e.flag {
-                    Flag::Exact => return val,
-                    Flag::Lower => alpha = alpha.max(val),
-                    Flag::Upper => beta = beta.min(val),
-                }
-                if alpha >= beta {
-                    return val;
-                }
+                // The stored best move always helps ordering. The value is usable
+                // for a cutoff in exact mode, and in play mode only when the entry
+                // was searched at least as deep as we need now (depth-preferred).
                 tt_move = e.best;
+                let usable = match depth {
+                    None => true,
+                    Some(d) => e.depth as u32 >= d,
+                };
+                if usable {
+                    let val = e.value + sd;
+                    match e.flag {
+                        Flag::Exact => return val,
+                        Flag::Lower => alpha = alpha.max(val),
+                        Flag::Upper => beta = beta.min(val),
+                    }
+                    if alpha >= beta {
+                        return val;
+                    }
+                }
             }
         }
 
@@ -696,8 +735,10 @@ impl<'a> Searcher<'a> {
 
             // Prefetch this child's TT slot now so its DRAM fetch overlaps the
             // child's own entry work (terminal/cutoff checks) before it probes.
-            if let Some(ck) = Self::key(&r.board, child_depth) {
-                self.tt.prefetch(ck);
+            if child_depth.is_none() || self.play_tt {
+                if let Some(ck) = Self::key(&r.board, child_depth) {
+                    self.tt.prefetch(ck);
+                }
             }
 
             // Principal Variation Search: search the first move with the full
@@ -748,9 +789,11 @@ impl<'a> Searcher<'a> {
         } else {
             Flag::Exact
         };
-        // Cache the store-independent value (subtract `sd`).
+        // Cache the store-independent value (subtract `sd`), tagged with the
+        // search depth (play mode) so a shallow result isn't reused as a deep one.
         if let Some(k) = key {
-            self.tt.store(k, best - sd, flag, best_move);
+            let store_depth = depth.unwrap_or(0).min(63) as u8;
+            self.tt.store(k, best - sd, flag, best_move, store_depth);
         }
         best
     }
@@ -989,6 +1032,7 @@ pub fn play_search(
     limit: Limit,
     use_endgame: bool,
     quiesce: bool,
+    play_tt: bool,
 ) -> Analysis {
     let tb = if use_endgame {
         tb.filter(|t| t.pits_per_side() == board.pits_per_side())
@@ -1006,6 +1050,7 @@ pub fn play_search(
     };
     let mut s = Searcher::new(rules, budget, endgame_cutoff, tb, 1 << 24);
     s.quiesce = quiesce;
+    s.play_tt = play_tt;
     if let Limit::Time(ms) = limit {
         s.deadline = Some(Instant::now() + std::time::Duration::from_millis(ms));
     }
