@@ -27,6 +27,9 @@ pub enum Engine {
     /// Try an exact solve within `budget` nodes; if it overflows, fall back to a
     /// depth-`depth` heuristic.
     Analyze { budget: u64, depth: u32 },
+    /// Depth-limited search that consults the endgame tablebase (perfect
+    /// endgame), applying the heuristic only above the tablebase frontier.
+    Play { depth: u32 },
 }
 
 impl Engine {
@@ -38,6 +41,7 @@ impl Engine {
         let a = match *self {
             Engine::Heuristic { depth } => solver::analyze_with_tb(b, rules, 0, depth, tb),
             Engine::Analyze { budget, depth } => solver::analyze_with_tb(b, rules, budget, depth, tb),
+            Engine::Play { depth } => solver::analyze_play(b, rules, tb, depth),
         };
         a.best_move
     }
@@ -54,8 +58,11 @@ impl Engine {
                 budget: b.parse().map_err(|_| format!("bad budget in '{spec}'"))?,
                 depth: d.parse().map_err(|_| format!("bad depth in '{spec}'"))?,
             }),
+            ["p", d] => Ok(Engine::Play {
+                depth: d.parse().map_err(|_| format!("bad depth in '{spec}'"))?,
+            }),
             _ => Err(format!(
-                "bad engine spec '{spec}' (use 'h:<depth>' or 'a:<budget>:<depth>')"
+                "bad engine spec '{spec}' (use 'h:<depth>', 'p:<depth>', or 'a:<budget>:<depth>')"
             )),
         }
     }

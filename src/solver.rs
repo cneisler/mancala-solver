@@ -516,7 +516,7 @@ impl<'a> Searcher<'a> {
     /// `depth == Some(d)` searches `d` plies then applies the heuristic.
     fn search(&mut self, b: &Board, mut alpha: i32, mut beta: i32, depth: Option<u32>) -> i32 {
         self.nodes += 1;
-        if depth.is_none() && self.nodes > self.budget {
+        if self.nodes > self.budget {
             self.aborted = true;
             return 0;
         }
@@ -528,21 +528,32 @@ impl<'a> Searcher<'a> {
                 Some(_) => m * STORE_WEIGHT,
             };
         }
-        // Exact-mode endgame cutoff: once few seeds remain in play, the exact
+        // Endgame cutoff (both modes): once few seeds remain, the exact future
         // margin is the banked store difference plus the store-independent `g`.
-        // A precomputed tablebase (O(1) lookup) takes priority over the lazy one.
-        if depth.is_none() {
+        // In exact mode that is the value directly; in depth-limited *play* it is
+        // scaled to the heuristic's units (like a terminal result), so the search
+        // treats a tablebase-resolved line as the proven outcome it is — perfect
+        // endgame play without recursing.
+        {
             let t = b.seeds_in_play();
-            if let Some(tb) = self.tb {
+            let g = if let Some(tb) = self.tb {
                 if t <= tb.cap() {
-                    let p = b.turn();
-                    let sd = b.store(p) as i32 - b.store(p.other()) as i32;
-                    return sd + tb.lookup(b).expect("position within tablebase cap") as i32;
+                    Some(tb.lookup(b).expect("position within tablebase cap") as i32)
+                } else {
+                    None
                 }
             } else if t <= self.endgame.cutoff() {
+                Some(self.endgame.g(b) as i32)
+            } else {
+                None
+            };
+            if let Some(g) = g {
                 let p = b.turn();
-                let sd = b.store(p) as i32 - b.store(p.other()) as i32;
-                return sd + self.endgame.g(b) as i32;
+                let margin = (b.store(p) as i32 - b.store(p.other()) as i32) + g;
+                return match depth {
+                    None => margin,
+                    Some(_) => margin * STORE_WEIGHT,
+                };
             }
         }
         if depth == Some(0) {
@@ -854,6 +865,16 @@ pub fn analyze_with_tb(
     // Exact search ran out of budget — fall back to a heuristic search.
     let mut limited = Searcher::new(rules, u64::MAX, 0, None, 1 << 22);
     limited.analyze_root(board, Some(fallback_depth))
+}
+
+/// Depth-limited **play** search that consults the endgame tablebase (so the
+/// endgame is played perfectly) and applies the heuristic at the horizon. Unlike
+/// [`analyze`]'s fallback — which never sees the tablebase — this is meant for
+/// strong play when an exact whole-game solve is out of reach.
+pub fn analyze_play(board: &Board, rules: Rules, tb: Option<&Tablebase>, depth: u32) -> Analysis {
+    let tb = tb.filter(|t| t.pits_per_side() == board.pits_per_side());
+    let mut s = Searcher::new(rules, u64::MAX, 0, tb, 1 << 24);
+    s.analyze_root(board, Some(depth.max(1)))
 }
 
 /// A reusable exact solver that keeps one transposition table warm across many
