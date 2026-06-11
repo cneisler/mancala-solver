@@ -152,16 +152,21 @@ pub extern "C" fn wasm_set_book(ptr: *const u8, len: usize) -> u32 {
     }
 }
 
-/// `analyze(board, turn, budget, fallback_depth, capture_empty)` → JSON analysis.
-/// Consults the opening book first (an instant exact lookup for early positions),
-/// then the installed tablebase for the endgame.
+/// `analyze(board, turn, budget, _unused, capture_empty)` → JSON analysis.
+///
+/// The browser uses the **play engine** as its only engine: an instant exact
+/// lookup from the opening book if the position is in it, otherwise a
+/// node-budgeted iterative-deepening play search (perfect endgames via the
+/// tablebase + quiescence). `budget` is the play search's node budget — bigger =
+/// deeper, stronger play. (A *time* budget would be ideal but `Instant` panics
+/// on wasm, so nodes it is.) The 4th argument is unused, kept for ABI stability.
 #[no_mangle]
 pub extern "C" fn wasm_analyze(
     ptr: *const u8,
     len: usize,
     turn: u32,
     budget: u32,
-    fallback_depth: u32,
+    _unused: u32,
     capture_empty: u32,
 ) -> *mut u8 {
     let s = unsafe { read(ptr, len) };
@@ -177,8 +182,17 @@ pub extern "C" fn wasm_analyze(
                 .as_ref()
                 .and_then(|book| book.analyze(&board, rules, tb.as_ref()))
         });
-        let a =
-            booked.unwrap_or_else(|| solver::analyze_with_tb(&board, rules, budget as u64, fallback_depth, tb.as_ref()));
+        let a = booked.unwrap_or_else(|| {
+            solver::play_search(
+                &board,
+                rules,
+                tb.as_ref(),
+                solver::Limit::Nodes(budget as u64),
+                true,  // use the endgame oracle (perfect endgames)
+                true,  // quiescence
+                true,  // transposition table
+            )
+        });
         analysis_json(&a)
     });
     ret(json)

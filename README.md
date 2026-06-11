@@ -63,16 +63,17 @@ deployment → Source: Deploy from a branch*, then pick your branch and the
 prebuilt wasm is committed; rerun `docs/build.sh` to refresh it after engine
 changes.
 
-In the browser the solver uses the in-memory search with a selectable **effort**
-(node budget: 2M / 20M / 80M). A small **6-pit endgame tablebase**
-(`docs/kalah6.bin`, ~5 MB, ≤ 12 seeds in play) ships with the page and is loaded
-on startup, so 6-pit endgames are solved **exactly and instantly** and mid-game
-positions resolve exactly far more often. Positions too big to prove within the
-budget (e.g. Kalah(6,4) straight from the opening) fall back to the **play
-engine** — a depth-limited search that still plays the endgame perfectly via the
-tablebase and uses a quiescence search, ~+90 Elo stronger than the bare
-heuristic (measured by the self-play harness) — clearly labelled as a
-non-proven estimate. The browser transposition table is memory-capped (the
+In the browser the **play engine is the engine**: it consults the opening book
+for an instant exact result if the position is in it, otherwise runs a
+node-budgeted iterative-deepening search that plays the endgame perfectly via
+the bundled tablebase and uses a quiescence search (~+90 Elo over the bare
+heuristic, measured by the self-play harness). The selectable **effort** (node
+budget: 2M / 20M / 80M) is that search's budget — bigger means it deepens
+further, so it directly buys stronger play. A small **6-pit endgame tablebase**
+(`docs/kalah6.bin`, ~5 MB, ≤ 12 seeds in play) and the opening book ship with the
+page; non-book mid-game positions are a strong, clearly-labelled *estimate*
+rather than a proof (the high-cap tablebases that would prove them aren't shipped
+to the browser). The browser transposition table is memory-capped (the
 dense table tops out at 256 MB), so a deep search slows down rather than
 crashing the tab — the earlier out-of-memory at the highest effort is fixed.
 Rebuild the bundled table with
