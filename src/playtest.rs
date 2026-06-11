@@ -16,16 +16,21 @@
 use std::collections::HashSet;
 
 use crate::board::{Board, Player, Rules};
-use crate::solver;
+use crate::solver::{self, Limit};
 use crate::tablebase::Tablebase;
 
-/// A move-selecting engine configuration.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// A move-selecting engine configuration. The `Limit` is the thinking budget —
+/// a fixed depth, or a node count (iterative deepening) so two engines can be
+/// compared on equal *work* rather than equal depth.
+#[derive(Clone, Copy, Debug)]
 pub enum Engine {
-    /// Depth-limited heuristic search (no attempt to prove a result).
-    Heuristic { depth: u32 },
-    /// Try an exact solve within `budget` nodes; if it overflows, fall back to a
-    /// depth-`depth` heuristic.
+    /// Plain heuristic search (no endgame oracle, no quiescence) — the baseline.
+    Heuristic { limit: Limit },
+    /// Tablebase/endgame-aware play (perfect endgame); `quiesce` extends forcing
+    /// moves at the horizon; `tt` enables the transposition table (toggle for
+    /// measuring its contribution).
+    Play { limit: Limit, quiesce: bool, tt: bool },
+    /// Try an exact solve within `budget` nodes; else a depth-`depth` heuristic.
     Analyze { budget: u64, depth: u32 },
 }
 
@@ -36,28 +41,47 @@ impl Engine {
             return None;
         }
         let a = match *self {
-            Engine::Heuristic { depth } => solver::analyze_with_tb(b, rules, 0, depth, tb),
+            Engine::Heuristic { limit } => solver::play_search(b, rules, tb, limit, false, false, true),
+            Engine::Play { limit, quiesce, tt } => solver::play_search(b, rules, tb, limit, true, quiesce, tt),
             Engine::Analyze { budget, depth } => solver::analyze_with_tb(b, rules, budget, depth, tb),
         };
         a.best_move
     }
 
-    /// Parse a compact spec: `h:<depth>` for a heuristic player, or
-    /// `a:<budget>:<depth>` for an exact-within-budget player.
+    /// Parse a compact spec. The limit token is `<n>` or `d<n>` for a fixed
+    /// depth, or `n<nodes>` for a node budget (iterative deepening):
+    ///   `h:<lim>` heuristic · `p:<lim>` play · `q:<lim>` play+quiescence ·
+    ///   `a:<budget>:<depth>` exact-then-heuristic.
     pub fn parse(spec: &str) -> Result<Engine, String> {
         let parts: Vec<&str> = spec.split(':').collect();
         match parts.as_slice() {
-            ["h", d] => Ok(Engine::Heuristic {
-                depth: d.parse().map_err(|_| format!("bad depth in '{spec}'"))?,
-            }),
+            ["h", l] => Ok(Engine::Heuristic { limit: parse_limit(l, spec)? }),
+            ["p", l] => Ok(Engine::Play { limit: parse_limit(l, spec)?, quiesce: false, tt: true }),
+            ["q", l] => Ok(Engine::Play { limit: parse_limit(l, spec)?, quiesce: true, tt: true }),
+            // `q:<lim>:nott` disables the transposition table (for A/B testing it).
+            ["q", l, "nott"] => Ok(Engine::Play { limit: parse_limit(l, spec)?, quiesce: true, tt: false }),
             ["a", b, d] => Ok(Engine::Analyze {
                 budget: b.parse().map_err(|_| format!("bad budget in '{spec}'"))?,
                 depth: d.parse().map_err(|_| format!("bad depth in '{spec}'"))?,
             }),
             _ => Err(format!(
-                "bad engine spec '{spec}' (use 'h:<depth>' or 'a:<budget>:<depth>')"
+                "bad engine spec '{spec}' (h/p/q:<lim> or a:<budget>:<depth>; <lim> = depth '6', \
+                 nodes 'n200000', or time 't50'; 'q:<lim>:nott' disables the TT)"
             )),
         }
+    }
+}
+
+/// Parse a limit token: `n<nodes>` → node budget; `t<ms>` → time budget;
+/// `d<n>` or bare `<n>` → depth.
+fn parse_limit(tok: &str, spec: &str) -> Result<Limit, String> {
+    if let Some(n) = tok.strip_prefix('n') {
+        Ok(Limit::Nodes(n.parse().map_err(|_| format!("bad node budget in '{spec}'"))?))
+    } else if let Some(t) = tok.strip_prefix('t') {
+        Ok(Limit::Time(t.parse().map_err(|_| format!("bad time budget (ms) in '{spec}'"))?))
+    } else {
+        let d = tok.strip_prefix('d').unwrap_or(tok);
+        Ok(Limit::Depth(d.parse().map_err(|_| format!("bad depth in '{spec}'"))?))
     }
 }
 
@@ -327,8 +351,8 @@ mod tests {
             seed: 1,
             threads: 1,
         };
-        let deep = Engine::Heuristic { depth: 5 };
-        let shallow = Engine::Heuristic { depth: 1 };
+        let deep = Engine::Heuristic { limit: Limit::Depth(5) };
+        let shallow = Engine::Heuristic { limit: Limit::Depth(1) };
         let res = run_match(deep, shallow, &cfg, None, |_, _| {}).unwrap();
         assert!(
             res.score() > 0.5,

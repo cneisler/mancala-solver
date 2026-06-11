@@ -12,6 +12,8 @@
 //! move). Heuristic values use an internal scale dominated by the store
 //! difference and are not directly comparable to exact seed margins.
 
+use std::time::Instant;
+
 use crate::board::{Board, Player, Rules, MAX_PITS};
 use crate::endgame::Endgame;
 use crate::tablebase::Tablebase;
@@ -109,6 +111,8 @@ struct TtProbe {
     value: i32,
     flag: Flag,
     best: Option<usize>,
+    /// Search depth the entry was computed to (play mode); 0 for exact entries.
+    depth: u8,
 }
 
 /// Number of bits used to encode a single cell in the packed key. Cells holding
@@ -117,8 +121,9 @@ const CELL_BITS: u32 = 6;
 
 /// Bits of payload packed into the low end of each `u128` slot alongside the
 /// board key (high bits): value (`i16`, 16 bits) + flag (2 bits) + best-move
-/// (4 bits). Keys needing more than `128 - PAYLOAD_BITS` bits are uncacheable.
-const PAYLOAD_BITS: u32 = 22;
+/// (4 bits) + search depth (6 bits, play mode only). Keys needing more than
+/// `128 - PAYLOAD_BITS` bits are uncacheable.
+const PAYLOAD_BITS: u32 = 28;
 const PAYLOAD_MASK: u128 = (1 << PAYLOAD_BITS) - 1;
 
 /// Maximum slots for the exact table (each is 16 B). On 64-bit hosts 2^28 slots
@@ -232,7 +237,7 @@ impl Tt {
     }
 
     #[inline]
-    fn encode(key: u128, value: i32, flag: Flag, best: Option<usize>) -> u128 {
+    fn encode(key: u128, value: i32, flag: Flag, best: Option<usize>, depth: u8) -> u128 {
         let v = (value.clamp(i16::MIN as i32, i16::MAX as i32) as i16) as u16 as u128;
         let f: u128 = match flag {
             Flag::Exact => 1,
@@ -240,7 +245,8 @@ impl Tt {
             Flag::Upper => 3,
         };
         let bm = best.map_or(15u128, |m| (m as u128) & 15);
-        (key << PAYLOAD_BITS) | v | (f << 16) | (bm << 18)
+        let d = (depth.min(63) as u128) << 22;
+        (key << PAYLOAD_BITS) | v | (f << 16) | (bm << 18) | d
     }
 
     #[inline]
@@ -257,6 +263,7 @@ impl Tt {
                 15 => None,
                 b => Some(b as usize),
             },
+            depth: ((payload >> 22) & 63) as u8,
         }
     }
 
@@ -292,12 +299,12 @@ impl Tt {
         None
     }
 
-    fn store(&mut self, key: u128, value: i32, flag: Flag, best: Option<usize>) {
+    fn store(&mut self, key: u128, value: i32, flag: Flag, best: Option<usize>, depth: u8) {
         if self.occupancy * 20 >= self.slots.len() * TT_GROW_NUM && self.slots.len() < self.max_slots
         {
             self.grow();
         }
-        let entry = Self::encode(key, value, flag, best);
+        let entry = Self::encode(key, value, flag, best, depth);
         let mut i = (tt_mix(key) as usize) & self.mask;
         for _ in 0..TT_MAX_PROBE {
             let e = self.slots[i];
@@ -338,6 +345,12 @@ impl Tt {
 /// prunes.
 const ENDGAME_CUTOFF: u32 = 14;
 
+/// Seeds-in-play cutoff for the **play** engine's lazy endgame oracle when no
+/// precomputed tablebase is supplied. Smaller than the solver's cutoff because
+/// the lazy `g` is recomputed per move during a game; this keeps it cheap while
+/// still giving perfect endgames on any board size.
+const PLAY_ENDGAME_CUTOFF: u32 = 12;
+
 struct Searcher<'a> {
     rules: Rules,
     tt: Tt,
@@ -350,8 +363,17 @@ struct Searcher<'a> {
     /// Optional precomputed offline tablebase; when present it overrides the
     /// lazy endgame for positions within its seed cap.
     tb: Option<&'a Tablebase>,
+    /// When true, the depth-limited search runs a quiescence search at the
+    /// horizon (extending forcing moves) instead of evaluating immediately.
+    quiesce: bool,
+    /// Whether the play (depth-limited) search uses the transposition table.
+    /// Always true in normal use; a toggle for measuring the TT's contribution.
+    play_tt: bool,
     nodes: u64,
     budget: u64,
+    /// Optional wall-clock deadline (for time-controlled play); checked
+    /// periodically so the overhead is negligible.
+    deadline: Option<Instant>,
     aborted: bool,
 }
 
@@ -369,10 +391,28 @@ impl<'a> Searcher<'a> {
             history: [[0; MAX_PITS]; 2],
             endgame: Endgame::new(rules, endgame_cutoff),
             tb,
+            quiesce: false,
+            play_tt: true,
             nodes: 0,
             budget,
+            deadline: None,
             aborted: false,
         }
+    }
+
+    /// Whether the search should stop now (node budget spent or deadline passed).
+    /// The clock is read only every 4096 nodes to keep the check ~free.
+    #[inline]
+    fn out_of_budget(&self) -> bool {
+        if self.nodes > self.budget {
+            return true;
+        }
+        if let Some(dl) = self.deadline {
+            if self.nodes & 0xFFF == 0 && Instant::now() >= dl {
+                return true;
+            }
+        }
+        false
     }
 
     /// Transposition-table key: the seed counts packed **mover-first**, plus a
@@ -395,12 +435,21 @@ impl<'a> Searcher<'a> {
     /// Returns `None` when the packed key would not fit in a `u128` (only very
     /// large boards or extremely full pits).
     fn key(b: &Board, depth: Option<u32>) -> Option<u128> {
+        // Play mode (depth-limited): a 64-bit position hash always fits the slot,
+        // so every board size gets a transposition table — the lossless packed
+        // key overflows a u128 past ~7 pits. Mover-first (mirror-canonical) and
+        // store-dependent (the heuristic depends on the stores). Collisions are
+        // astronomically rare and at worst cost one suboptimal move — this is the
+        // player, not the prover, which keeps the exact packed key below.
+        if depth.is_some() {
+            return Some(Self::play_hash(b));
+        }
+
+        // Exact mode: a lossless, store-independent packed key (mover-first,
+        // CELL_BITS per pit, plus a depth marker), or `None` if it would not fit.
         let n = b.pits_per_side();
         let cells = b.cells();
-        let store_independent = depth.is_none();
-        let included = if store_independent { 2 * n } else { 2 * n + 2 };
-        // Bits: cells (CELL_BITS each) + 8 depth-marker bits.
-        if included as u32 * CELL_BITS + 8 > 128 {
+        if (2 * n) as u32 * CELL_BITS + 8 + PAYLOAD_BITS > 128 {
             return None;
         }
         let mut packed: u128 = 0;
@@ -418,16 +467,25 @@ impl<'a> Searcher<'a> {
                     return None;
                 }
             }
-            if !store_independent && !push(b.store(p)) {
-                return None;
-            }
         }
-        let depth_marker: u128 = match depth {
-            None => 255,
-            Some(d) => d.min(254) as u128,
-        };
-        packed = (packed << 8) | depth_marker;
+        packed = (packed << 8) | 255; // exact depth marker
         Some(packed)
+    }
+
+    /// 64-bit FNV-1a hash of the position (mover-first cells + stores) for the
+    /// play-mode transposition table. Forced non-zero so it never equals the
+    /// empty-slot sentinel.
+    fn play_hash(b: &Board) -> u128 {
+        let n = b.pits_per_side();
+        let mover = b.turn();
+        let mut h = 0xcbf2_9ce4_8422_2325u64;
+        for p in [mover, mover.other()] {
+            for i in 0..n {
+                h = (h ^ b.cells()[b.pit_global(p, i)] as u64).wrapping_mul(0x0000_0100_0000_01b3);
+            }
+            h = (h ^ b.store(p) as u64).wrapping_mul(0x0000_0100_0000_01b3);
+        }
+        (h | 1) as u128
     }
 
     /// Generate legal moves for the side to move into `buf`, ordered to improve
@@ -512,11 +570,89 @@ impl<'a> Searcher<'a> {
         store_diff * STORE_WEIGHT + (pit_self - pit_opp)
     }
 
+    /// If `b` falls within the tablebase (or lazy endgame) cutoff, return its
+    /// exact margin from the side to move — `× STORE_WEIGHT` when `scaled` (to
+    /// match the depth-limited heuristic's units), otherwise the raw seed margin.
+    fn resolved(&mut self, b: &Board, scaled: bool) -> Option<i32> {
+        let t = b.seeds_in_play();
+        let g = if let Some(tb) = self.tb {
+            (t <= tb.cap()).then(|| tb.lookup(b).expect("position within tablebase cap") as i32)
+        } else if t <= self.endgame.cutoff() {
+            Some(self.endgame.g(b) as i32)
+        } else {
+            None
+        };
+        g.map(|g| {
+            let p = b.turn();
+            let margin = (b.store(p) as i32 - b.store(p.other()) as i32) + g;
+            if scaled {
+                margin * STORE_WEIGHT
+            } else {
+                margin
+            }
+        })
+    }
+
+    /// Quiescence search: at the horizon, instead of trusting the static eval in
+    /// the middle of a tactical sequence, keep searching the **forcing** moves —
+    /// extra-turn moves (a free continuation) and captures (a material swing) —
+    /// until the position is quiet. Both kinds strictly reduce the seeds in play,
+    /// so this terminates. Quiet moves are not searched (the eval is taken as a
+    /// stand-pat floor, as in standard quiescence).
+    fn quiesce(&mut self, b: &Board, mut alpha: i32, beta: i32) -> i32 {
+        self.nodes += 1;
+        if self.out_of_budget() {
+            self.aborted = true;
+            return 0;
+        }
+        if b.is_terminal() {
+            return b.terminal_margin(b.turn()) * STORE_WEIGHT;
+        }
+        if let Some(v) = self.resolved(b, true) {
+            return v;
+        }
+        let stand = self.heuristic(b);
+        if stand >= beta {
+            return stand;
+        }
+        if stand > alpha {
+            alpha = stand;
+        }
+        let p = b.turn();
+        let n = b.pits_per_side();
+        let base = b.pit_global(p, 0);
+        for i in 0..n {
+            if b.cells()[base + i] == 0 {
+                continue;
+            }
+            let r = b.apply(&self.rules, i);
+            if !r.extra_turn && !r.captured {
+                continue; // quiet move — not part of the tactical sequence
+            }
+            // Extra-turn moves keep the side to move (no negation); captures pass.
+            let v = if r.extra_turn {
+                self.quiesce(&r.board, alpha, beta)
+            } else {
+                -self.quiesce(&r.board, -beta, -alpha)
+            };
+            if self.aborted {
+                return 0;
+            }
+            if v >= beta {
+                return v;
+            }
+            if v > alpha {
+                alpha = v;
+            }
+        }
+        alpha
+    }
+
     /// Negamax + alpha-beta. `depth == None` searches to terminal (exact);
     /// `depth == Some(d)` searches `d` plies then applies the heuristic.
     fn search(&mut self, b: &Board, mut alpha: i32, mut beta: i32, depth: Option<u32>) -> i32 {
         self.nodes += 1;
-        if depth.is_none() && self.nodes > self.budget {
+        if self.out_of_budget() {
             self.aborted = true;
             return 0;
         }
@@ -528,25 +664,18 @@ impl<'a> Searcher<'a> {
                 Some(_) => m * STORE_WEIGHT,
             };
         }
-        // Exact-mode endgame cutoff: once few seeds remain in play, the exact
-        // margin is the banked store difference plus the store-independent `g`.
-        // A precomputed tablebase (O(1) lookup) takes priority over the lazy one.
-        if depth.is_none() {
-            let t = b.seeds_in_play();
-            if let Some(tb) = self.tb {
-                if t <= tb.cap() {
-                    let p = b.turn();
-                    let sd = b.store(p) as i32 - b.store(p.other()) as i32;
-                    return sd + tb.lookup(b).expect("position within tablebase cap") as i32;
-                }
-            } else if t <= self.endgame.cutoff() {
-                let p = b.turn();
-                let sd = b.store(p) as i32 - b.store(p.other()) as i32;
-                return sd + self.endgame.g(b) as i32;
-            }
+        // Endgame cutoff (both modes): once few seeds remain, a tablebase-resolved
+        // line is the proven outcome — return it (scaled in play mode), giving
+        // perfect endgame play without recursing.
+        if let Some(v) = self.resolved(b, depth.is_some()) {
+            return v;
         }
         if depth == Some(0) {
-            return self.heuristic(b);
+            return if self.quiesce {
+                self.quiesce(b, alpha, beta)
+            } else {
+                self.heuristic(b)
+            };
         }
 
         // In exact mode the TT stores the store-independent value `g = M - sd`
@@ -559,21 +688,36 @@ impl<'a> Searcher<'a> {
             0
         };
 
-        let key = Self::key(b, depth);
+        // The exact search always keys the TT; the play search can be told not to
+        // (for measuring the table's contribution).
+        let key = if depth.is_none() || self.play_tt {
+            Self::key(b, depth)
+        } else {
+            None
+        };
         let alpha_orig = alpha;
         let mut tt_move = None;
         if let Some(k) = key {
             if let Some(e) = self.tt.get(k) {
-                let val = e.value + sd;
-                match e.flag {
-                    Flag::Exact => return val,
-                    Flag::Lower => alpha = alpha.max(val),
-                    Flag::Upper => beta = beta.min(val),
-                }
-                if alpha >= beta {
-                    return val;
-                }
+                // The stored best move always helps ordering. The value is usable
+                // for a cutoff in exact mode, and in play mode only when the entry
+                // was searched at least as deep as we need now (depth-preferred).
                 tt_move = e.best;
+                let usable = match depth {
+                    None => true,
+                    Some(d) => e.depth as u32 >= d,
+                };
+                if usable {
+                    let val = e.value + sd;
+                    match e.flag {
+                        Flag::Exact => return val,
+                        Flag::Lower => alpha = alpha.max(val),
+                        Flag::Upper => beta = beta.min(val),
+                    }
+                    if alpha >= beta {
+                        return val;
+                    }
+                }
             }
         }
 
@@ -591,8 +735,10 @@ impl<'a> Searcher<'a> {
 
             // Prefetch this child's TT slot now so its DRAM fetch overlaps the
             // child's own entry work (terminal/cutoff checks) before it probes.
-            if let Some(ck) = Self::key(&r.board, child_depth) {
-                self.tt.prefetch(ck);
+            if child_depth.is_none() || self.play_tt {
+                if let Some(ck) = Self::key(&r.board, child_depth) {
+                    self.tt.prefetch(ck);
+                }
             }
 
             // Principal Variation Search: search the first move with the full
@@ -643,9 +789,11 @@ impl<'a> Searcher<'a> {
         } else {
             Flag::Exact
         };
-        // Cache the store-independent value (subtract `sd`).
+        // Cache the store-independent value (subtract `sd`), tagged with the
+        // search depth (play mode) so a shallow result isn't reused as a deep one.
         if let Some(k) = key {
-            self.tt.store(k, best - sd, flag, best_move);
+            let store_depth = depth.unwrap_or(0).min(63) as u8;
+            self.tt.store(k, best - sd, flag, best_move, store_depth);
         }
         best
     }
@@ -851,9 +999,83 @@ pub fn analyze_with_tb(
     // Release the (large) exact table before the fallback allocates its own.
     drop(exact);
 
-    // Exact search ran out of budget — fall back to a heuristic search.
-    let mut limited = Searcher::new(rules, u64::MAX, 0, None, 1 << 22);
-    limited.analyze_root(board, Some(fallback_depth))
+    // Too big to prove within budget — play it with the strong play engine
+    // (endgame tablebase / lazy endgame for perfect endgames, plus quiescence),
+    // not the bare static heuristic.
+    play_search(board, rules, tb, Limit::Depth(fallback_depth), true, true, true)
+}
+
+/// A thinking limit for the play search.
+#[derive(Clone, Copy, Debug)]
+pub enum Limit {
+    /// Search exactly this many plies.
+    Depth(u32),
+    /// Iteratively deepen until this many search nodes have been visited.
+    /// Reproducible (deterministic), but ignores per-node cost — so it favors
+    /// heavier evaluations. Good for fast iteration on changes that don't alter
+    /// per-node cost.
+    Nodes(u64),
+    /// Iteratively deepen until this many milliseconds have elapsed. The honest
+    /// measure (it docks a slow eval the nodes it can't afford), but
+    /// nondeterministic. Use for any change that alters per-node cost.
+    Time(u64),
+}
+
+/// Play search: depth-limited / node-budgeted alpha-beta with the heuristic at
+/// the horizon. `use_endgame` adds the exact endgame oracle (tablebase if given,
+/// else the lazy endgame) for perfect endgames on any board size; `quiesce` adds
+/// a quiescence search through forcing moves. With `use_endgame == false` and
+/// `quiesce == false` this is the plain heuristic player.
+pub fn play_search(
+    board: &Board,
+    rules: Rules,
+    tb: Option<&Tablebase>,
+    limit: Limit,
+    use_endgame: bool,
+    quiesce: bool,
+    play_tt: bool,
+) -> Analysis {
+    let tb = if use_endgame {
+        tb.filter(|t| t.pits_per_side() == board.pits_per_side())
+    } else {
+        None
+    };
+    let endgame_cutoff = if use_endgame && tb.is_none() {
+        PLAY_ENDGAME_CUTOFF
+    } else {
+        0
+    };
+    let budget = match limit {
+        Limit::Nodes(n) => n,
+        Limit::Depth(_) | Limit::Time(_) => u64::MAX,
+    };
+    let mut s = Searcher::new(rules, budget, endgame_cutoff, tb, 1 << 24);
+    s.quiesce = quiesce;
+    s.play_tt = play_tt;
+    if let Limit::Time(ms) = limit {
+        s.deadline = Some(Instant::now() + std::time::Duration::from_millis(ms));
+    }
+
+    match limit {
+        Limit::Depth(d) => s.analyze_root(board, Some(d.max(1))),
+        Limit::Nodes(_) | Limit::Time(_) => {
+            // Iterative deepening: keep the deepest iteration that finished within
+            // budget (nodes/time accumulate across iterations). If even depth 1
+            // overruns a tiny budget, keep it anyway.
+            let mut best: Option<Analysis> = None;
+            for depth in 1..=64u32 {
+                let a = s.analyze_root(board, Some(depth));
+                let completed = !s.aborted;
+                if a.best_move.is_some() && (completed || best.is_none()) {
+                    best = Some(a);
+                }
+                if !completed {
+                    break;
+                }
+            }
+            best.expect("at least one iteration runs")
+        }
+    }
 }
 
 /// A reusable exact solver that keeps one transposition table warm across many
