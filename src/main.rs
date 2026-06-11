@@ -633,7 +633,9 @@ fn cmd_playtest(args: &[String]) -> Result<(), String> {
                 eprint!("\r  {label} playing… {pct:3}%   ");
             }
         })?;
-        eprint!("\r");
+        // Clear the (stderr) progress line and terminate it, so results stay on
+        // their own lines even when stderr is merged into stdout (`2>&1`).
+        eprintln!("\r{:40}\r", "");
         let (lo, hi) = res.elo_ci();
         println!(
             "  {label:<7} W{:<4} L{:<4} D{:<4}  {:5.1}%  {:+6.1} Elo [{:+.0} … {:+.0}]  LOS {:.1}%",
