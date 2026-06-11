@@ -29,7 +29,8 @@ pub enum Engine {
     Analyze { budget: u64, depth: u32 },
     /// Depth-limited search that consults the endgame tablebase (perfect
     /// endgame), applying the heuristic only above the tablebase frontier.
-    Play { depth: u32 },
+    /// `quiesce` extends forcing moves at the horizon.
+    Play { depth: u32, quiesce: bool },
 }
 
 impl Engine {
@@ -41,7 +42,7 @@ impl Engine {
         let a = match *self {
             Engine::Heuristic { depth } => solver::analyze_with_tb(b, rules, 0, depth, tb),
             Engine::Analyze { budget, depth } => solver::analyze_with_tb(b, rules, budget, depth, tb),
-            Engine::Play { depth } => solver::analyze_play(b, rules, tb, depth),
+            Engine::Play { depth, quiesce } => solver::analyze_play(b, rules, tb, depth, quiesce),
         };
         a.best_move
     }
@@ -60,9 +61,14 @@ impl Engine {
             }),
             ["p", d] => Ok(Engine::Play {
                 depth: d.parse().map_err(|_| format!("bad depth in '{spec}'"))?,
+                quiesce: false,
+            }),
+            ["q", d] => Ok(Engine::Play {
+                depth: d.parse().map_err(|_| format!("bad depth in '{spec}'"))?,
+                quiesce: true,
             }),
             _ => Err(format!(
-                "bad engine spec '{spec}' (use 'h:<depth>', 'p:<depth>', or 'a:<budget>:<depth>')"
+                "bad engine spec '{spec}' (use 'h:<d>', 'p:<d>', 'q:<d>' [quiescence], or 'a:<budget>:<d>')"
             )),
         }
     }

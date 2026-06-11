@@ -350,6 +350,9 @@ struct Searcher<'a> {
     /// Optional precomputed offline tablebase; when present it overrides the
     /// lazy endgame for positions within its seed cap.
     tb: Option<&'a Tablebase>,
+    /// When true, the depth-limited search runs a quiescence search at the
+    /// horizon (extending forcing moves) instead of evaluating immediately.
+    quiesce: bool,
     nodes: u64,
     budget: u64,
     aborted: bool,
@@ -369,6 +372,7 @@ impl<'a> Searcher<'a> {
             history: [[0; MAX_PITS]; 2],
             endgame: Endgame::new(rules, endgame_cutoff),
             tb,
+            quiesce: false,
             nodes: 0,
             budget,
             aborted: false,
@@ -512,6 +516,84 @@ impl<'a> Searcher<'a> {
         store_diff * STORE_WEIGHT + (pit_self - pit_opp)
     }
 
+    /// If `b` falls within the tablebase (or lazy endgame) cutoff, return its
+    /// exact margin from the side to move — `× STORE_WEIGHT` when `scaled` (to
+    /// match the depth-limited heuristic's units), otherwise the raw seed margin.
+    fn resolved(&mut self, b: &Board, scaled: bool) -> Option<i32> {
+        let t = b.seeds_in_play();
+        let g = if let Some(tb) = self.tb {
+            (t <= tb.cap()).then(|| tb.lookup(b).expect("position within tablebase cap") as i32)
+        } else if t <= self.endgame.cutoff() {
+            Some(self.endgame.g(b) as i32)
+        } else {
+            None
+        };
+        g.map(|g| {
+            let p = b.turn();
+            let margin = (b.store(p) as i32 - b.store(p.other()) as i32) + g;
+            if scaled {
+                margin * STORE_WEIGHT
+            } else {
+                margin
+            }
+        })
+    }
+
+    /// Quiescence search: at the horizon, instead of trusting the static eval in
+    /// the middle of a tactical sequence, keep searching the **forcing** moves —
+    /// extra-turn moves (a free continuation) and captures (a material swing) —
+    /// until the position is quiet. Both kinds strictly reduce the seeds in play,
+    /// so this terminates. Quiet moves are not searched (the eval is taken as a
+    /// stand-pat floor, as in standard quiescence).
+    fn quiesce(&mut self, b: &Board, mut alpha: i32, beta: i32) -> i32 {
+        self.nodes += 1;
+        if self.nodes > self.budget {
+            self.aborted = true;
+            return 0;
+        }
+        if b.is_terminal() {
+            return b.terminal_margin(b.turn()) * STORE_WEIGHT;
+        }
+        if let Some(v) = self.resolved(b, true) {
+            return v;
+        }
+        let stand = self.heuristic(b);
+        if stand >= beta {
+            return stand;
+        }
+        if stand > alpha {
+            alpha = stand;
+        }
+        let p = b.turn();
+        let n = b.pits_per_side();
+        let base = b.pit_global(p, 0);
+        for i in 0..n {
+            if b.cells()[base + i] == 0 {
+                continue;
+            }
+            let r = b.apply(&self.rules, i);
+            if !r.extra_turn && !r.captured {
+                continue; // quiet move — not part of the tactical sequence
+            }
+            // Extra-turn moves keep the side to move (no negation); captures pass.
+            let v = if r.extra_turn {
+                self.quiesce(&r.board, alpha, beta)
+            } else {
+                -self.quiesce(&r.board, -beta, -alpha)
+            };
+            if self.aborted {
+                return 0;
+            }
+            if v >= beta {
+                return v;
+            }
+            if v > alpha {
+                alpha = v;
+            }
+        }
+        alpha
+    }
+
     /// Negamax + alpha-beta. `depth == None` searches to terminal (exact);
     /// `depth == Some(d)` searches `d` plies then applies the heuristic.
     fn search(&mut self, b: &Board, mut alpha: i32, mut beta: i32, depth: Option<u32>) -> i32 {
@@ -528,36 +610,18 @@ impl<'a> Searcher<'a> {
                 Some(_) => m * STORE_WEIGHT,
             };
         }
-        // Endgame cutoff (both modes): once few seeds remain, the exact future
-        // margin is the banked store difference plus the store-independent `g`.
-        // In exact mode that is the value directly; in depth-limited *play* it is
-        // scaled to the heuristic's units (like a terminal result), so the search
-        // treats a tablebase-resolved line as the proven outcome it is — perfect
-        // endgame play without recursing.
-        {
-            let t = b.seeds_in_play();
-            let g = if let Some(tb) = self.tb {
-                if t <= tb.cap() {
-                    Some(tb.lookup(b).expect("position within tablebase cap") as i32)
-                } else {
-                    None
-                }
-            } else if t <= self.endgame.cutoff() {
-                Some(self.endgame.g(b) as i32)
-            } else {
-                None
-            };
-            if let Some(g) = g {
-                let p = b.turn();
-                let margin = (b.store(p) as i32 - b.store(p.other()) as i32) + g;
-                return match depth {
-                    None => margin,
-                    Some(_) => margin * STORE_WEIGHT,
-                };
-            }
+        // Endgame cutoff (both modes): once few seeds remain, a tablebase-resolved
+        // line is the proven outcome — return it (scaled in play mode), giving
+        // perfect endgame play without recursing.
+        if let Some(v) = self.resolved(b, depth.is_some()) {
+            return v;
         }
         if depth == Some(0) {
-            return self.heuristic(b);
+            return if self.quiesce {
+                self.quiesce(b, alpha, beta)
+            } else {
+                self.heuristic(b)
+            };
         }
 
         // In exact mode the TT stores the store-independent value `g = M - sd`
@@ -871,9 +935,16 @@ pub fn analyze_with_tb(
 /// endgame is played perfectly) and applies the heuristic at the horizon. Unlike
 /// [`analyze`]'s fallback — which never sees the tablebase — this is meant for
 /// strong play when an exact whole-game solve is out of reach.
-pub fn analyze_play(board: &Board, rules: Rules, tb: Option<&Tablebase>, depth: u32) -> Analysis {
+pub fn analyze_play(
+    board: &Board,
+    rules: Rules,
+    tb: Option<&Tablebase>,
+    depth: u32,
+    quiesce: bool,
+) -> Analysis {
     let tb = tb.filter(|t| t.pits_per_side() == board.pits_per_side());
     let mut s = Searcher::new(rules, u64::MAX, 0, tb, 1 << 24);
+    s.quiesce = quiesce;
     s.analyze_root(board, Some(depth.max(1)))
 }
 
