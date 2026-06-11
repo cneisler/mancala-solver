@@ -523,6 +523,7 @@ fn cmd_playtest(args: &[String]) -> Result<(), String> {
     let mut b_spec = "h:6".to_string();
     let mut pits: usize = 6;
     let mut seeds: u8 = 4;
+    let mut sizes_arg: Option<String> = None;
     let mut games: usize = 1000;
     let mut opening_plies: u32 = 4;
     let mut seed: u64 = 1;
@@ -547,6 +548,8 @@ fn cmd_playtest(args: &[String]) -> Result<(), String> {
                     .parse()
                     .map_err(|_| "--seeds must be 0..=255".to_string())?
             }
+            // Multi-size gauntlet: comma-separated PITSxSEEDS, e.g. "5x4,6x4,7x5,8x6".
+            "--sizes" => sizes_arg = Some(take_value(arg, &mut iter)?.to_string()),
             "--games" => {
                 games = take_value(arg, &mut iter)?
                     .parse()
@@ -586,65 +589,85 @@ fn cmd_playtest(args: &[String]) -> Result<(), String> {
     // Each opening is played from both sides, so two games per opening.
     let openings = games.div_ceil(2).max(1);
 
-    // Resolve the endgame tablebase the play engines consult: an explicit --tb,
-    // an auto-built/cached per-size one (default), or none.
-    let tb = if let Some(p) = &tb_path {
-        let t = Tablebase::load(Path::new(p)).map_err(|e| format!("failed to load tablebase '{p}': {e}"))?;
-        if t.pits_per_side() != pits {
-            return Err(format!(
-                "tablebase is for {}-pit boards, but --pits {pits}",
-                t.pits_per_side()
-            ));
-        }
-        Some(t)
-    } else if no_tb {
-        None
-    } else {
-        let cap = tb_cap.unwrap_or_else(|| playtest_tb_cap(pits));
-        Some(playtest_auto_tb(pits, cap, rules)?)
+    // Board sizes to test: an explicit gauntlet list, or the single --pits/--seeds.
+    let sizes: Vec<(usize, u8)> = match &sizes_arg {
+        Some(s) => parse_sizes(s)?,
+        None => vec![(pits, seeds)],
     };
-
-    let cfg = MatchConfig {
-        pits,
-        seeds,
-        rules,
-        openings,
-        opening_plies,
-        seed,
-        threads,
-    };
+    let multi = sizes.len() > 1;
+    if multi && tb_path.is_some() {
+        return Err("--tb is for a single size; with --sizes the tablebase is auto-built per size".into());
+    }
 
     println!("Playtest  A = {a_spec}   B = {b_spec}");
     println!(
-        "Board {pits}×{seeds}, {} games ({openings} openings × 2 sides), {opening_plies} random opening plies, seed {seed}, {threads} thread(s)",
+        "{} games/size ({openings} openings × 2 sides), {opening_plies} opening plies, seed {seed}, {threads} thread(s)",
         openings * 2
     );
     println!();
 
-    let total = openings * 2;
-    let mut last_pct = usize::MAX;
-    let res = run_match(a, b, &cfg, tb.as_ref(), |done, tot| {
-        let pct = done * 100 / tot.max(1);
-        if pct != last_pct && pct % 5 == 0 {
-            last_pct = pct;
-            eprint!("\r  playing… {pct:3}% ({done}/{tot})");
-        }
-    })?;
-    eprintln!("\r  done.                                ");
+    let mut pooled = mancala::playtest::MatchResult::default();
+    for &(p, sd) in &sizes {
+        // Resolve the per-size endgame oracle: explicit --tb (single size only),
+        // an auto-built/cached per-size table (default), or none.
+        let tb = if let Some(path) = &tb_path {
+            let t = Tablebase::load(Path::new(path)).map_err(|e| format!("failed to load tablebase '{path}': {e}"))?;
+            if t.pits_per_side() != p {
+                return Err(format!("tablebase is for {}-pit boards, but --pits {p}", t.pits_per_side()));
+            }
+            Some(t)
+        } else if no_tb {
+            None
+        } else {
+            let cap = tb_cap.unwrap_or_else(|| playtest_tb_cap(p));
+            Some(playtest_auto_tb(p, cap, rules)?)
+        };
 
-    let n = res.games();
-    let (lo, hi) = res.elo_ci();
-    let elo = res.elo();
-    println!("Result (from A's perspective):");
-    println!(
-        "  W {}  L {}  D {}   ({} games)",
-        res.wins, res.losses, res.draws, n
-    );
-    println!("  Score: {:.1}%", res.score() * 100.0);
-    println!("  Elo (A − B): {:+.1}  [95% CI {:+.0} … {:+.0}]", elo, lo, hi);
-    println!("  LOS (A stronger than B): {:.1}%", res.los() * 100.0);
-    let _ = total;
+        let cfg = MatchConfig { pits: p, seeds: sd, rules, openings, opening_plies, seed, threads };
+        let mut last_pct = usize::MAX;
+        let label = format!("({p},{sd})");
+        let res = run_match(a, b, &cfg, tb.as_ref(), |done, tot| {
+            let pct = done * 100 / tot.max(1);
+            if pct != last_pct && pct % 5 == 0 {
+                last_pct = pct;
+                eprint!("\r  {label} playing… {pct:3}%   ");
+            }
+        })?;
+        eprint!("\r");
+        let (lo, hi) = res.elo_ci();
+        println!(
+            "  {label:<7} W{:<4} L{:<4} D{:<4}  {:5.1}%  {:+6.1} Elo [{:+.0} … {:+.0}]  LOS {:.1}%",
+            res.wins, res.losses, res.draws, res.score() * 100.0, res.elo(), lo, hi, res.los() * 100.0
+        );
+        pooled.wins += res.wins;
+        pooled.draws += res.draws;
+        pooled.losses += res.losses;
+    }
+
+    if multi {
+        let (lo, hi) = pooled.elo_ci();
+        println!();
+        println!(
+            "  AGG     W{:<4} L{:<4} D{:<4}  {:5.1}%  {:+6.1} Elo [{:+.0} … {:+.0}]  LOS {:.1}%   ({} games over {} sizes)",
+            pooled.wins, pooled.losses, pooled.draws, pooled.score() * 100.0, pooled.elo(), lo, hi,
+            pooled.los() * 100.0, pooled.games(), sizes.len()
+        );
+    }
     Ok(())
+}
+
+/// Parse a gauntlet size list like "5x4,6x4,7x5" into `(pits, seeds)` pairs.
+fn parse_sizes(s: &str) -> Result<Vec<(usize, u8)>, String> {
+    s.split(',')
+        .filter(|t| !t.trim().is_empty())
+        .map(|t| {
+            let (p, sd) = t.trim().split_once(['x', 'X']).ok_or_else(|| format!("bad size '{t}' (use PITSxSEEDS, e.g. 6x4)"))?;
+            Ok((
+                p.trim().parse().map_err(|_| format!("bad pits in '{t}'"))?,
+                sd.trim().parse().map_err(|_| format!("bad seeds in '{t}'"))?,
+            ))
+        })
+        .collect()
 }
 
 /// Render the board as a classic two-row Kalah diagram.
@@ -863,8 +886,11 @@ PLAYTEST:
     confidence interval, and the likelihood A is stronger. Engine specs:
         h:<depth>             depth-limited heuristic search
         a:<budget>:<depth>    exact within <budget> nodes, else heuristic
-    Options: --pits N --seeds S --games N --opening-plies K --seed X
-             --threads N --tb <file> --capture-empty
+    Limits: '<d>'/'d<d>' = depth, 'n<nodes>' = node budget (iterative deepening,
+    so engines compare on equal work, not equal depth — e.g. 'q:n100000').
+    Options: --pits N --seeds S --sizes 5x4,6x4,7x5,8x6 (multi-size gauntlet)
+             --games N --opening-plies K --seed X --threads N --tb <file>
+             --tb-cap N --no-tb --capture-empty
 
 OPTIONS (analyze & start):
     --turn <0|1>        Side to move (0 = P0/South, 1 = P1/North). Default: 0
