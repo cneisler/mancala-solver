@@ -67,10 +67,12 @@ In the browser the solver uses the in-memory search with a selectable **effort**
 (node budget: 2M / 20M / 80M). A small **6-pit endgame tablebase**
 (`docs/kalah6.bin`, ~5 MB, ≤ 12 seeds in play) ships with the page and is loaded
 on startup, so 6-pit endgames are solved **exactly and instantly** and mid-game
-positions resolve exactly far more often. Positions still too big for the budget
-(e.g. Kalah(6,4) straight from the opening) fall back to a clearly-labelled
-heuristic estimate — the high-cap tablebases that would solve those aren't
-shipped to the browser. The browser transposition table is memory-capped (the
+positions resolve exactly far more often. Positions too big to prove within the
+budget (e.g. Kalah(6,4) straight from the opening) fall back to the **play
+engine** — a depth-limited search that still plays the endgame perfectly via the
+tablebase and uses a quiescence search, ~+90 Elo stronger than the bare
+heuristic (measured by the self-play harness) — clearly labelled as a
+non-proven estimate. The browser transposition table is memory-capped (the
 dense table tops out at 256 MB), so a deep search slows down rather than
 crashing the tab — the earlier out-of-memory at the highest effort is fixed.
 Rebuild the bundled table with
