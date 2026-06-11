@@ -937,25 +937,67 @@ pub fn analyze_with_tb(
     limited.analyze_root(board, Some(fallback_depth))
 }
 
-/// Depth-limited **play** search that consults the endgame tablebase (so the
-/// endgame is played perfectly) and applies the heuristic at the horizon. Unlike
-/// [`analyze`]'s fallback — which never sees the tablebase — this is meant for
-/// strong play when an exact whole-game solve is out of reach.
-pub fn analyze_play(
+/// A thinking limit for the play search.
+#[derive(Clone, Copy, Debug)]
+pub enum Limit {
+    /// Search exactly this many plies.
+    Depth(u32),
+    /// Iteratively deepen until this many search nodes have been visited,
+    /// returning the deepest fully-completed iteration (an anytime search, so
+    /// two engines can be compared on equal *work* rather than equal depth).
+    Nodes(u64),
+}
+
+/// Play search: depth-limited / node-budgeted alpha-beta with the heuristic at
+/// the horizon. `use_endgame` adds the exact endgame oracle (tablebase if given,
+/// else the lazy endgame) for perfect endgames on any board size; `quiesce` adds
+/// a quiescence search through forcing moves. With `use_endgame == false` and
+/// `quiesce == false` this is the plain heuristic player.
+pub fn play_search(
     board: &Board,
     rules: Rules,
     tb: Option<&Tablebase>,
-    depth: u32,
+    limit: Limit,
+    use_endgame: bool,
     quiesce: bool,
 ) -> Analysis {
-    let tb = tb.filter(|t| t.pits_per_side() == board.pits_per_side());
-    // Perfect endgame on ANY board size: use the precomputed tablebase if one is
-    // supplied, otherwise the lazy in-memory endgame (computed on the fly for any
-    // size) up to a feasible seed cutoff.
-    let endgame_cutoff = if tb.is_some() { 0 } else { PLAY_ENDGAME_CUTOFF };
-    let mut s = Searcher::new(rules, u64::MAX, endgame_cutoff, tb, 1 << 24);
+    let tb = if use_endgame {
+        tb.filter(|t| t.pits_per_side() == board.pits_per_side())
+    } else {
+        None
+    };
+    let endgame_cutoff = if use_endgame && tb.is_none() {
+        PLAY_ENDGAME_CUTOFF
+    } else {
+        0
+    };
+    let budget = match limit {
+        Limit::Nodes(n) => n,
+        Limit::Depth(_) => u64::MAX,
+    };
+    let mut s = Searcher::new(rules, budget, endgame_cutoff, tb, 1 << 24);
     s.quiesce = quiesce;
-    s.analyze_root(board, Some(depth.max(1)))
+
+    match limit {
+        Limit::Depth(d) => s.analyze_root(board, Some(d.max(1))),
+        Limit::Nodes(_) => {
+            // Iterative deepening: keep the deepest iteration that finished within
+            // budget (nodes accumulate across iterations, so the budget bounds the
+            // whole search). If even depth 1 overruns a tiny budget, keep it anyway.
+            let mut best: Option<Analysis> = None;
+            for depth in 1..=64u32 {
+                let a = s.analyze_root(board, Some(depth));
+                let completed = !s.aborted;
+                if a.best_move.is_some() && (completed || best.is_none()) {
+                    best = Some(a);
+                }
+                if !completed {
+                    break;
+                }
+            }
+            best.expect("at least one iteration runs")
+        }
+    }
 }
 
 /// A reusable exact solver that keeps one transposition table warm across many
